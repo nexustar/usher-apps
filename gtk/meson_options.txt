@@ -1,0 +1,24 @@
+option(
+  'usher_backend',
+  type: 'string',
+  value: '',
+  description: 'Path to an usher executable to bundle in libexec/usher',
+)
+option(
+  'test_url',
+  type: 'string',
+  value: '',
+  description: 'Running usher URL for optional API/SSE integration tests',
+)
+option(
+  'test_password',
+  type: 'string',
+  value: '',
+  description: 'Password for the optional integration-test usher',
+)
+option(
+  'test_display',
+  type: 'string',
+  value: '',
+  description: 'Broadway display for the optional GTK session-switch test',
+)

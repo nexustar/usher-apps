@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.nexustar.Usher</id>
+  <name>usher</name>
+  <summary>Manage local coding-agent sessions</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>A native GNOME client for viewing and controlling Claude Code and Codex sessions through usher.</p>
+  </description>
+  <launchable type="desktop-id">io.github.nexustar.Usher.desktop</launchable>
+  <url type="homepage">https://github.com/nexustar/usher</url>
+  <content_rating type="oars-1.1"/>
+</component>
+

@@ -1,0 +1,3 @@
+#!/bin/sh
+js_dir="${USHER_JS_DIR:-@JS_DIR@}"
+exec '@GJS@' -m "$js_dir/main.js" "$@"
