@@ -1,5 +1,7 @@
 /* Windows 2000 theme for usher.
- * Start with: usher serve --theme ./2000.css
+ * Targets usher 0.8.
+ * Link or copy this file to <usher-data-dir>/theme.css, normally:
+ * ~/.local/share/usher/theme.css
  */
 
 :root {
@@ -152,6 +154,10 @@ body {
 .cwd-toggle-archived:hover {
   background: #000080;
   color: #ffffff;
+}
+
+.cwd-archived-actions {
+  gap: 0.25rem;
 }
 
 .sidebar-new,
@@ -320,6 +326,33 @@ body.sidebar-collapsed .main-wrap {
   margin-top: 0;
 }
 
+.command-preview {
+  padding: 3px;
+  border: 2px solid;
+  border-color: #ffffff #404040 #404040 #ffffff;
+  border-radius: 0;
+  background: #c0c0c0;
+  box-shadow: 1px 1px 0 #000000;
+}
+
+.command-option {
+  border: 1px solid transparent;
+  border-radius: 0;
+  color: #000000;
+}
+
+.command-option:hover,
+.command-option.selected {
+  border-color: #ffffff #404040 #404040 #ffffff;
+  background: #000080;
+  color: #ffffff;
+}
+
+.command-option:hover small,
+.command-option.selected small {
+  color: #ffffff;
+}
+
 .render-pill {
   padding: 1px;
   background: #c0c0c0;
@@ -371,6 +404,35 @@ select,
 .composer-bar {
   background: #c0c0c0;
   border-top: 1px solid #808080;
+}
+
+.composer-model-pickers {
+  gap: 4px;
+}
+
+.composer-picker {
+  padding: 0.22rem 0.45rem;
+  border: 2px solid;
+  border-color: #404040 #ffffff #ffffff #404040;
+  border-radius: 0;
+  background: #ffffff;
+  box-shadow: inset 1px 1px 0 #808080;
+}
+
+.composer-model-pickers[data-backend="claude"] .composer-picker { color: #800000; }
+.composer-model-pickers[data-backend="codex"] .composer-picker { color: #000080; }
+.composer-model-pickers[data-backend="pi"] .composer-picker { color: #000000; }
+
+.composer-picker:hover {
+  background: #ffffff;
+}
+
+.composer-picker:focus-visible {
+  box-shadow: inset 1px 1px 0 #808080, 0 0 0 1px #000080;
+}
+
+.picker-divider {
+  display: none;
 }
 
 .content code {
@@ -447,6 +509,34 @@ select,
 .session-title,
 .cwd-label {
   font-family: Tahoma, "MS Sans Serif", Arial, sans-serif;
+}
+
+.chat-message {
+  border-bottom-style: solid;
+  border-bottom-color: #c0c0c0;
+}
+
+.session-interactions {
+  border: 2px solid;
+  border-color: #ffffff #404040 #404040 #ffffff;
+  border-radius: 0;
+  background: #c0c0c0;
+  box-shadow: 1px 1px 0 #000000;
+}
+
+.interaction.ask .qback {
+  color: #000000;
+  background: #c0c0c0;
+  border: 2px solid;
+  border-color: #ffffff #404040 #404040 #ffffff;
+  border-radius: 0;
+  box-shadow: 1px 1px 0 #000000;
+}
+
+.interaction.ask .qback:active {
+  border-color: #404040 #ffffff #ffffff #404040;
+  box-shadow: none;
+  transform: translate(1px, 1px);
 }
 
 .settings-menu,
