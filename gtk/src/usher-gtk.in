@@ -1,3 +1,5 @@
 #!/bin/sh
 js_dir="${USHER_JS_DIR:-@JS_DIR@}"
+USHER_BUNDLED_BACKEND="${USHER_BUNDLED_BACKEND:-@BUNDLED_BACKEND@}"
+export USHER_BUNDLED_BACKEND
 exec '@GJS@' -m "$js_dir/main.js" "$@"

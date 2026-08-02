@@ -7,12 +7,24 @@ import Gtk from 'gi://Gtk?version=4.0';
 import Pango from 'gi://Pango';
 
 import { ApiClient } from './api-client.js';
+import { isSandboxed } from './backend-process.js';
 import { EventStream } from './event-stream.js';
 import { deriveAuthCookie } from './local-auth.js';
-import { ServerStore } from './server-store.js';
-import * as markdown from './markdown.js';
+import { DEFAULT_EMBEDDED_PORT, ServerStore } from './server-store.js';
+import { InteractionCards } from './interaction.js';
+import { Sidebar } from './sidebar.js';
+import { clearPassword, lookupPassword, storePassword } from './keyring.js';
+import { showSettingsDialog } from './settings.js';
+import { ellipsize } from './text.js';
+import { TranscriptView } from './transcript.js';
 
 Gio._promisify(Gtk.FileDialog.prototype, 'open', 'open_finish');
+
+// Inline transcript images are capped to this box; clicking one opens it full
+// size. Both are logical pixels, scaled down only (never up).
+// One page of transcript history, matching the web client's window size.
+const TRANSCRIPT_PAGE = 100;
+
 
 const TranscriptItem = GObject.registerClass(
 class TranscriptItem extends GObject.Object {
@@ -43,10 +55,12 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._backend.configure(this._currentServer || {});
     this._api = new ApiClient(backend.baseUrl);
     this._selectedId = null;
-    this._transcriptLimit = 100;
+    this._transcriptLimit = TRANSCRIPT_PAGE;
+    this._windowStart = 0;
+    this._transcriptTotal = 0;
+    this._loadingEarlier = false;
     this._eventStream = null;
     this._started = false;
-    this._rows = new Map();
     this._liveTurn = null;
     this._selectionEpoch = 0;
     this._turnRunning = false;
@@ -55,13 +69,45 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._renderedTurns = [];
     this._scrollPending = false;
     this._connectionEpoch = 0;
-    this._sessionsDigest = null;
     this._pendingInteractions = [];
     this._interactionKey = null;
     this._pollBusy = false;
     this._previewRefreshId = 0;
+    this._editorURL = '';
+    this._commands = [];
+    this._commandSource = '';
+    this._newMode = false;
+    this._newAgent = '';
+    this._newBackend = '';
+    this._newModel = '';
+    this._modelCatalog = null;
+    this._agentProfiles = [];
+    this._drafts = new Map();
+    this._rawMarkdown = false;
+    this._optimisticTurn = null;
+
+    this._sidebar = new Sidebar({
+      selectedId: () => this._selectedId,
+      searchQuery: () => this._search?.get_text().trim().toLowerCase() || '',
+      onSelect: id => this._selectSession(id),
+    });
+    this._interactions = new InteractionCards({
+      respond: (id, payload, buttons) => this._respondInteraction(id, payload, buttons),
+    });
+    this._transcript = new TranscriptView({
+      window: this,
+      api: this._api,
+      sessionId: () => this._selectedId,
+      backendName: () => this._currentSession?.backend || '',
+      rawMarkdown: () => this._rawMarkdown,
+      onFork: uuid => this._forkTurn(uuid),
+      onImageLoaded: () => this._scrollToBottom(),
+    });
 
     this._buildUi();
+
+    // Only a backend this app owns reports its lifetime here.
+    this._backend.onState = (state, detail) => this._onBackendState(state, detail);
 
     // Interactions (permission requests / questions) have no SSE channel;
     // the server expects clients to poll, like the web UI does. The same
@@ -70,6 +116,68 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._pollTick();
       return GLib.SOURCE_CONTINUE;
     });
+  }
+
+  _installWindowActions() {
+    const add = (name, callback) => {
+      const action = new Gio.SimpleAction({ name });
+      action.connect('activate', callback);
+      this.add_action(action);
+      return action;
+    };
+    add('settings', (_action, parameter) => this._showSettings(parameter?.get_string()[0]));
+    add('servers', () => this._showConnectionDialog());
+
+    // Reading the message as the model wrote it, markup and all.
+    const raw = new Gio.SimpleAction({
+      name: 'raw-markdown',
+      state: GLib.Variant.new_boolean(false),
+    });
+    raw.connect('activate', () => {
+      const next = !raw.get_state().get_boolean();
+      raw.set_state(GLib.Variant.new_boolean(next));
+      this._rawMarkdown = next;
+      this._rerenderTranscript();
+    });
+    this.add_action(raw);
+
+    // Radio state for the new-session config menu.
+    const choice = (name, apply) => {
+      const action = new Gio.SimpleAction({
+        name,
+        parameter_type: GLib.VariantType.new('s'),
+        state: GLib.Variant.new_string(''),
+      });
+      action.connect('activate', (_action, parameter) => {
+        apply(parameter.get_string()[0]);
+      });
+      this.add_action(action);
+    };
+    choice('new-agent', value => this._applyNewAgent(value));
+    choice('new-backend', value => {
+      this._newBackend = value;
+      this._newModel = ''; // the previous model belongs to the previous backend
+      this._newAgent = '';
+      this._syncNewConfig();
+    });
+    choice('new-model', value => {
+      this._newModel = value;
+      this._syncNewConfig();
+    });
+  }
+
+  _showSettings(page = '') {
+    showSettingsDialog(this, {
+      api: this._api,
+      page,
+      toast: message => this._showToast(message),
+      // The working directories already on screen are the ones worth
+      // suggesting in the agent and task forms.
+      recentCwds: [...new Set(
+        [...(this._sidebar.sessionsById?.values() || [])].map(s => s.cwd).filter(Boolean)
+      )].sort(),
+      onSessionStarted: id => this._selectSession(id).catch(() => {}),
+    }).catch(error => this._showToast(error.message || String(error)));
   }
 
   async _pollTick() {
@@ -104,11 +212,6 @@ class UsherWindow extends Adw.ApplicationWindow {
     const refresh = new Gtk.Button({ icon_name: 'view-refresh-symbolic', tooltip_text: 'Refresh' });
     refresh.set_action_name('app.refresh');
     header.pack_start(refresh);
-    const server = new Gtk.Button({
-      icon_name: 'network-server-symbolic',
-      tooltip_text: 'Connect to an usher server',
-    });
-    server.connect('clicked', () => this._showConnectionDialog());
     this._connectionStatus = new Gtk.Image({
       icon_name: 'network-offline-symbolic',
       tooltip_text: 'Live updates disconnected; reconnecting…',
@@ -122,6 +225,20 @@ class UsherWindow extends Adw.ApplicationWindow {
       visible: false,
     });
     header.pack_end(this._sessionMenu);
+    // Context usage sits beside the title it describes, hidden until the
+    // backend reports a token count.
+    this._usage = new Gtk.MenuButton({ visible: false, tooltip_text: 'Context usage' });
+    this._usage.add_css_class('flat');
+    this._usageLabel = new Gtk.Label();
+    this._usageLabel.add_css_class('caption');
+    this._usage.set_child(this._usageLabel);
+    this._usageDetail = new Gtk.Box({
+      orientation: Gtk.Orientation.VERTICAL,
+      spacing: 6,
+      margin_top: 12, margin_bottom: 12, margin_start: 12, margin_end: 12,
+    });
+    this._usage.set_popover(new Gtk.Popover({ child: this._usageDetail }));
+    header.pack_end(this._usage);
     contentToolbar.add_top_bar(header);
 
     const sidebarBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL });
@@ -144,49 +261,34 @@ class UsherWindow extends Adw.ApplicationWindow {
       GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE
     );
     sidebarHeader.pack_end(searchToggle);
-    sidebarHeader.pack_start(server);
+    // Primary menu: app-scoped destinations, per the HIG. Session-scoped
+    // actions stay in the conversation header's own menu.
+    const primaryMenu = new Gio.Menu();
+    const viewSection = new Gio.Menu();
+    viewSection.append('Show _Raw Markdown', 'win.raw-markdown');
+    primaryMenu.append_section(null, viewSection);
+    const appSection = new Gio.Menu();
+    // Server profiles are client-local and switching one changes what
+    // Settings shows, so the two stay separate entries.
+    appSection.append('_Servers…', 'win.servers');
+    appSection.append('_Settings', 'win.settings');
+    primaryMenu.append_section(null, appSection);
+    sidebarHeader.pack_end(new Gtk.MenuButton({
+      icon_name: 'open-menu-symbolic',
+      tooltip_text: 'Main menu',
+      menu_model: primaryMenu,
+      primary: true,
+    }));
     const newSession = new Gtk.Button({
       icon_name: 'list-add-symbolic',
       tooltip_text: 'New session',
     });
-    newSession.connect('clicked', () => this._showNewSessionDialog());
+    newSession.connect('clicked', () => this._showNewSession());
     sidebarHeader.pack_start(newSession);
     sidebarToolbar.add_top_bar(sidebarHeader);
+    this._installWindowActions();
 
-    this._sessionList = new Gtk.ListBox({ selection_mode: Gtk.SelectionMode.SINGLE });
-    this._sessionList.add_css_class('navigation-sidebar');
-    this._sessionList.set_filter_func(row => this._rowMatches(row));
-    this._sessionList.set_header_func((row, before) => {
-      if (before && before.groupKey === row.groupKey) {
-        row.set_header(null);
-        return;
-      }
-      const headerBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL });
-      headerBox.set_margin_top(6);
-      headerBox.set_margin_bottom(2);
-      headerBox.set_margin_start(8);
-      headerBox.set_margin_end(8);
-      const label = new Gtk.Label({
-        label: row.groupLabel,
-        xalign: 0,
-        ellipsize: Pango.EllipsizeMode.MIDDLE,
-        max_width_chars: 32,
-        tooltip_text: row.groupLabel,
-      });
-      label.add_css_class('caption-heading');
-      label.add_css_class('dim-label');
-      headerBox.append(label);
-      row.set_header(headerBox);
-    });
-    this._sessionList.connect('row-selected', (_list, row) => {
-      if (row?.sessionId && row.sessionId !== this._selectedId) {
-        this._selectSession(row.sessionId);
-      }
-    });
-    const sidebarScroll = new Gtk.ScrolledWindow({ hscrollbar_policy: Gtk.PolicyType.NEVER });
-    sidebarScroll.set_child(this._sessionList);
-    sidebarScroll.set_vexpand(true);
-    sidebarBox.append(sidebarScroll);
+    sidebarBox.append(this._sidebar.widget);
     sidebarToolbar.set_content(sidebarBox);
 
     const content = new Gtk.Box({
@@ -226,7 +328,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       listItem.set_activatable(false);
       listItem.set_selectable(false);
       const item = listItem.get_item();
-      listItem.set_child(this._turnWidget(item.turn));
+      listItem.set_child(this._transcript.turnWidget(item.turn));
     });
     transcriptFactory.connect('unbind', (_factory, listItem) => listItem.set_child(null));
     this._messages = new Gtk.ListView({
@@ -262,6 +364,30 @@ class UsherWindow extends Adw.ApplicationWindow {
       visible: false,
     });
     composer.append(this._permissionBox);
+    // Only the new-session view shows this: the working directory is the one
+    // thing a session needs that a message cannot carry.
+    this._newBar = new Gtk.Box({
+      orientation: Gtk.Orientation.HORIZONTAL,
+      spacing: 6,
+      visible: false,
+    });
+    const cwdLabel = new Gtk.Label({ label: 'Directory' });
+    cwdLabel.add_css_class('dim-label');
+    cwdLabel.add_css_class('caption');
+    this._newBar.append(cwdLabel);
+    this._newCwd = new Gtk.Entry({
+      placeholder_text: '/absolute/path/to/project',
+      hexpand: true,
+    });
+    this._newBar.append(this._newCwd);
+    this._newCwdSuggestions = new Gtk.MenuButton({
+      icon_name: 'view-list-symbolic',
+      tooltip_text: 'Recent working directories',
+      valign: Gtk.Align.CENTER,
+    });
+    this._newCwdSuggestions.add_css_class('flat');
+    this._newBar.append(this._newCwdSuggestions);
+    composer.append(this._newBar);
     this._prompt = new Gtk.TextView({ wrap_mode: Gtk.WrapMode.WORD_CHAR, accepts_tab: false });
     this._prompt.set_hexpand(true);
     this._prompt.set_top_margin(8);
@@ -295,7 +421,9 @@ class UsherWindow extends Adw.ApplicationWindow {
     const promptBuffer = this._prompt.get_buffer();
     promptBuffer.connect('changed', () => {
       this._promptPlaceholder.set_visible(promptBuffer.get_char_count() === 0);
+      this._updateCommandPopup();
     });
+    this._buildCommandPopup();
     composer.append(promptOverlay);
     const composerBar = new Gtk.Box({
       orientation: Gtk.Orientation.HORIZONTAL,
@@ -315,6 +443,13 @@ class UsherWindow extends Adw.ApplicationWindow {
     });
     this._autoApprove.connect('toggled', () => this._toggleAutoApprove());
     composerBar.append(this._autoApprove);
+    // Agent / backend / model for a session that does not exist yet.
+    this._newConfig = new Gtk.MenuButton({
+      visible: false,
+      tooltip_text: 'Agent, backend, and model for the new session',
+    });
+    this._newConfig.add_css_class('flat');
+    composerBar.append(this._newConfig);
     const sendBox = new Gtk.Box({ spacing: 6, halign: Gtk.Align.END, hexpand: true });
     this._send = new Gtk.Button({ icon_name: 'send-to-symbolic', tooltip_text: 'Send message' });
     this._send.add_css_class('suggested-action');
@@ -338,7 +473,7 @@ class UsherWindow extends Adw.ApplicationWindow {
         this._sendMessage();
         return true;
       }
-      return false;
+      return this._handleCommandKey(keyval);
     });
     this._prompt.add_controller(promptKeys);
     // The composer lives in the ToolbarView's bottom bar so it gets native
@@ -383,7 +518,9 @@ class UsherWindow extends Adw.ApplicationWindow {
     if (this._started) return;
     if (!this._currentServer) {
       this._showError('No usher server configured', new Error(
-        'Add a remote server URL or configure a local usher binary.'
+        isSandboxed()
+          ? 'Run usher on this machine, then add its address as a server.'
+          : 'Add a remote server URL or configure a local usher binary.'
       ));
       this._showConnectionDialog();
       return;
@@ -391,21 +528,59 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._started = true;
     try {
       await this._backend.ensureRunning();
-      // A locally managed backend shares this machine's usher data dir, so
-      // authenticate the same way _connectTo does for the embedded server.
-      if (this._backend.binaryPath) {
-        const cookie = deriveAuthCookie();
-        if (cookie) this._api.setAuthCookie(cookie);
-      }
+      this._authenticateOwnBackend();
       this._title.set_subtitle(this._backend.baseUrl);
       const sessions = await this._api.listSessions();
       this._renderSessions(sessions || []);
+      this._loadServerConfig();
     } catch (error) {
       this._showError('Could not connect to usher', error);
       this._started = false;
       // A saved connection remains selected even when it is temporarily
       // unavailable. Do not interrupt startup with a modal; the server button
       // remains available for editing or switching it explicitly.
+    }
+  }
+
+  _onBackendState(state, detail) {
+    if (state === 'restarting') {
+      this._showToast('usher stopped unexpectedly — restarting it');
+      this._backendDetail = detail;
+      return;
+    }
+    if (state === 'running') {
+      this._showToast('usher restarted');
+      this._backendDetail = '';
+      this.refresh().catch(() => {});
+      return;
+    }
+    // Failed for good: polling and the event stream will fail from here on,
+    // and their indicator says only "disconnected".
+    this._backendDetail = detail;
+    this._showError('The local usher backend stopped',
+      new Error(detail || 'It exited repeatedly and was not restarted.'));
+  }
+
+  // A backend we spawned shares this account's data directory, so its cookie
+  // can be derived from disk. One that was merely already listening need not —
+  // its data directory may be another one — so it authenticates like any
+  // other server.
+  _authenticateOwnBackend() {
+    if (!this._backend.startedHere) return;
+    const cookie = deriveAuthCookie();
+    if (cookie) this._api.setAuthCookie(cookie);
+  }
+
+  // editor_url is optional server configuration; without it the session menu
+  // simply omits the editor entry.
+  async _loadServerConfig() {
+    const epoch = this._connectionEpoch;
+    try {
+      const config = await this._api.getConfig();
+      if (this._connectionEpoch !== epoch) return;
+      this._editorURL = config?.editor_url || '';
+    } catch (_) {
+      this._editorURL = '';
     }
   }
 
@@ -420,82 +595,10 @@ class UsherWindow extends Adw.ApplicationWindow {
   }
 
   _renderSessions(sessions) {
-    const recent = session => Date.parse(session.last_input_at) ||
-      Date.parse(session.last_event_at) || 0;
-    const groupRecent = new Map();
-    for (const session of sessions) {
-      const cwd = session.cwd || '(unknown)';
-      groupRecent.set(cwd, Math.max(groupRecent.get(cwd) || 0, recent(session)));
-    }
-    sessions.sort((a, b) => {
-      if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
-      if (a.pinned && b.pinned) return recent(b) - recent(a);
-      const ac = a.cwd || '(unknown)';
-      const bc = b.cwd || '(unknown)';
-      if (ac !== bc) return (groupRecent.get(bc) || 0) - (groupRecent.get(ac) || 0);
-      return recent(b) - recent(a);
-    });
-
-    this._sessionsById = new Map(sessions.map(session => [session.id, session]));
-
-    // Rebuilding tears down open popovers and selection feedback, so skip
-    // the write when the poll delivered identical data.
-    const digest = JSON.stringify(sessions);
-    if (digest === this._sessionsDigest) return;
-    this._sessionsDigest = digest;
-
-    let child;
-    while ((child = this._sessionList.get_first_child())) this._sessionList.remove(child);
-    this._rows.clear();
-
-    for (const session of sessions) {
-      const row = new Gtk.ListBoxRow({
-        activatable: true,
-        selectable: true,
-        tooltip_text: session.title || '(untitled)',
-      });
-      const rowContent = new Gtk.Box({
-        orientation: Gtk.Orientation.HORIZONTAL,
-        spacing: 6,
-        margin_top: 6,
-        margin_bottom: 6,
-        margin_start: 8,
-        margin_end: 8,
-      });
-      const title = new Gtk.Label({
-        label: session.title || '(untitled)',
-        xalign: 0,
-        hexpand: true,
-        single_line_mode: true,
-        ellipsize: Pango.EllipsizeMode.END,
-      });
-      rowContent.append(title);
-      row.sessionId = session.id;
-      row.groupKey = session.pinned ? '\u0000pinned' : (session.cwd || '(unknown)');
-      row.groupLabel = session.pinned ? 'Pinned' : (session.cwd || '(unknown)');
-      row.searchText = `${session.title || ''} ${session.cwd || ''}`.toLowerCase();
-      if (session.status === 'running' || session.status === 'awaiting_permission') {
-        const status = new Gtk.Image({
-          icon_name: session.status === 'awaiting_permission'
-            ? 'dialog-password-symbolic' : 'media-playback-start-symbolic',
-          tooltip_text: session.status.replace('_', ' '),
-        });
-        status.add_css_class(session.status === 'awaiting_permission' ? 'warning' : 'accent');
-        rowContent.prepend(status);
-      }
-      row.set_child(rowContent);
-      if (session.archived) {
-        row.add_css_class('dim-label');
-        row.archived = true;
-      }
-      this._sessionList.append(row);
-      this._rows.set(session.id, row);
-    }
-    this._sessionList.invalidate_filter();
-    this._sessionList.invalidate_headers();
-    const selected = this._selectedId ? this._rows.get(this._selectedId) : null;
+    this._sidebar.render(sessions);
+    const selected = this._selectedId ? this._sidebar.rows.get(this._selectedId) : null;
     if (selected) {
-      this._sessionList.select_row(selected);
+      this._sidebar.select(selected);
     } else if (this._selectedId) {
       this._selectionEpoch++;
       this._selectedId = null;
@@ -515,7 +618,7 @@ class UsherWindow extends Adw.ApplicationWindow {
   // and on selection changes.
   _syncSessionMenu() {
     const session = this._selectedId
-      ? (this._sessionsById?.get(this._selectedId) || this._currentSession)
+      ? (this._sidebar.sessionsById?.get(this._selectedId) || this._currentSession)
       : null;
     if (!session || session.is_subagent) {
       this._sessionMenu.set_visible(false);
@@ -526,15 +629,10 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._sessionMenu.set_popover(this._sessionActionsPopover(session));
   }
 
-  _filterSessions() {
-    this._sessionList.invalidate_filter();
-    this._sessionList.invalidate_headers();
-  }
-
-  _rowMatches(row) {
-    const query = this._search?.get_text().trim().toLowerCase() || '';
-    return !query || row.searchText?.includes(query);
-  }
+  // The row that ends a directory group. Archived sessions arrive in pages,
+  // so this is a small button bar rather than one activatable row: collapsed
+  // it offers the count, expanded it offers "Collapse" and — while any are
+  // still held back — "Show N more".
 
   _sessionActionsPopover(session) {
     const popover = new Gtk.Popover();
@@ -584,10 +682,34 @@ class UsherWindow extends Adw.ApplicationWindow {
           'Session worker paused'
         )
       );
+    } else {
+      // Wakes the backend without adding a turn — useful before steering a
+      // session that has gone idle.
+      add(
+        'media-playback-start-symbolic',
+        'Resume worker',
+        () => this._runSessionAction(
+          () => this._api.resumeSession(session.id),
+          'Session worker resumed'
+        )
+      );
+    }
+    if (this._editorURL && session.cwd) {
+      add('text-editor-symbolic', 'Open in editor', () => this._openInEditor(session.cwd));
     }
     add('user-trash-symbolic', 'Delete permanently…', () => this._showDeleteDialog(session), true);
     popover.set_child(box);
     return popover;
+  }
+
+  // The server supplies a URL template with {cwd} substituted verbatim.
+  _openInEditor(cwd) {
+    const url = this._editorURL.replace('{cwd}', cwd);
+    try {
+      Gtk.UriLauncher.new(url).launch(this, null, null);
+    } catch (error) {
+      this._showToast(`Could not open the editor: ${error.message || error}`);
+    }
   }
 
   async _runSessionAction(operation, successMessage) {
@@ -630,7 +752,7 @@ class UsherWindow extends Adw.ApplicationWindow {
   _showDeleteDialog(session) {
     const dialog = new Adw.AlertDialog({
       heading: 'Delete session permanently?',
-      body: `“${this._displayText(session.title || '(untitled)', 120)}” and its transcript will be deleted. This cannot be undone.`,
+      body: `“${ellipsize(session.title || '(untitled)', 120)}” and its transcript will be deleted. This cannot be undone.`,
     });
     dialog.add_response('cancel', 'Cancel');
     dialog.add_response('delete', 'Delete');
@@ -651,6 +773,9 @@ class UsherWindow extends Adw.ApplicationWindow {
   }
 
   _clearSessionSelection() {
+    this._stashDraft();
+    this._leaveNewSession();
+    this._prompt.get_buffer().set_text('', -1);
     this._selectionEpoch++;
     this._selectedId = null;
     this._interactionKey = null;
@@ -661,7 +786,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._renderedTurns = [];
     this._transcriptStore.remove_all();
     this._liveTurn = null;
-    this._sessionList.unselect_all();
+    this._sidebar.unselectAll();
     this._status.set_title('Select a session');
     this._status.set_description('Choose a conversation from the sidebar.');
     this._status.set_visible(true);
@@ -671,63 +796,214 @@ class UsherWindow extends Adw.ApplicationWindow {
     if (this._splitView.get_collapsed()) this._splitView.set_show_sidebar(true);
   }
 
-  _showNewSessionDialog() {
-    const dialog = new Adw.PreferencesDialog({ title: 'New Session' });
-    const page = new Adw.PreferencesPage({
-      title: 'New Session',
-      icon_name: 'list-add-symbolic',
+  // Takes over the conversation surface: the ordinary composer, plus the
+  // controls a session needs before it exists.
+  async _showNewSession() {
+    this._selectionEpoch++;
+    this._selectedId = null;
+    this._eventStream?.stop();
+    this._eventStream = null;
+    this._liveTurn = null;
+    this._renderedTurns = [];
+    this._transcriptStore.remove_all();
+    this._sidebar.unselectAll();
+    this._newMode = true;
+    this._newAgent = '';
+    this._newBackend = '';
+    this._newModel = '';
+    this._currentSession = null;
+
+    this._title.set_title('New session');
+    this._title.set_subtitle('');
+    this._status.set_title('New session');
+    this._status.set_description(
+      'Set a working directory, then write the first message.');
+    this._status.set_visible(true);
+    this._chatScroll.set_visible(false);
+    this._loadEarlier.set_visible(false);
+    this._usage.set_visible(false);
+    this._syncSessionMenu();
+    this._interactionKey = null;
+    this._updateInteractions(this._pendingInteractions);
+    this._commands = [];
+    this._newBar.set_visible(true);
+    this._newConfig.set_visible(true);
+    this._composer.set_visible(true);
+    this._syncAutoApprove();
+    this._syncComposerActions();
+    if (this._splitView.get_collapsed()) this._splitView.set_show_sidebar(false);
+    this._newCwdSuggestions.set_popover(this._cwdSuggestionPopover());
+    this._prompt.grab_focus();
+
+    // The catalogs only decorate the picker; the view is usable (and the
+    // request valid) with everything left at its default.
+    try {
+      const [catalog, agentList] = await Promise.all([
+        this._api.listModels(), this._api.listAgents(),
+      ]);
+      if (!this._newMode) return;
+      this._modelCatalog = catalog;
+      this._agentProfiles = agentList?.agents || [];
+    } catch (_) {
+      this._modelCatalog = null;
+      this._agentProfiles = [];
+    }
+    this._syncNewConfig();
+  }
+
+  _leaveNewSession() {
+    if (!this._newMode) return;
+    this._newMode = false;
+    this._newBar.set_visible(false);
+    this._newConfig.set_visible(false);
+    this._prompt.get_buffer().set_text('', -1);
+    this._newCwd.set_text('');
+  }
+
+  // Directories already in the session list are the ones worth offering.
+  _cwdSuggestionPopover() {
+    const cwds = [...new Set(
+      [...(this._sidebar.sessionsById?.values() || [])].map(s => s.cwd).filter(Boolean)
+    )].sort();
+    const list = new Gtk.ListBox({ selection_mode: Gtk.SelectionMode.NONE });
+    list.add_css_class('boxed-list');
+    list.set_size_request(320, -1);
+    const popover = new Gtk.Popover({
+      child: new Gtk.ScrolledWindow({
+        child: list, max_content_height: 320, propagate_natural_height: true,
+        hscrollbar_policy: Gtk.PolicyType.NEVER,
+      }),
     });
-    const group = new Adw.PreferencesGroup({
-      title: 'Conversation',
-      description: 'The working directory must be an absolute path on the usher host.',
-    });
-    const cwd = new Adw.EntryRow({ title: 'Working directory' });
-    const model = new Adw.EntryRow({ title: 'Model (optional)' });
-    const message = new Adw.EntryRow({ title: 'Initial message' });
-    group.add(cwd);
-    group.add(model);
-    group.add(message);
-    page.add(group);
-    const actions = new Adw.PreferencesGroup();
-    const createRow = new Adw.ActionRow({
-      title: 'Create session',
-      subtitle: 'Starts the first turn immediately.',
-    });
-    const create = new Gtk.Button({ label: 'Create', valign: Gtk.Align.CENTER });
-    create.add_css_class('suggested-action');
-    createRow.add_suffix(create);
-    createRow.set_activatable_widget(create);
-    actions.add(createRow);
-    page.add(actions);
-    dialog.add(page);
-    create.connect('clicked', async () => {
-      const workingDirectory = cwd.get_text().trim();
-      const initialMessage = message.get_text().trim();
-      if (!workingDirectory || !initialMessage) {
-        this._showToast('Working directory and initial message are required');
-        return;
+    if (!cwds.length) {
+      const empty = new Adw.ActionRow({ title: 'No recent directories' });
+      empty.add_css_class('dim-label');
+      list.append(empty);
+      return popover;
+    }
+    for (const cwd of cwds) {
+      const row = new Adw.ActionRow({ title: cwd, activatable: true });
+      row.connect('activated', () => {
+        this._newCwd.set_text(cwd);
+        popover.popdown();
+      });
+      list.append(row);
+    }
+    return popover;
+  }
+
+  // Rebuilds the composer's config menu and its summary label. Agents are
+  // top-level radio items (the common choice); backend and model are submenus,
+  // because the model list depends on the backend.
+  _syncNewConfig() {
+    const backends = this._modelCatalog?.backends || [];
+    const backend = this._newBackend || backends[0] || '';
+    const models = this._modelCatalog?.models?.[backend] || [];
+
+    const menu = new Gio.Menu();
+    if (this._agentProfiles?.length) {
+      const agents = new Gio.Menu();
+      agents.append('Custom', 'win.new-agent::');
+      for (const profile of this._agentProfiles) {
+        agents.append(profile.name, `win.new-agent::${profile.name}`);
       }
-      create.set_sensitive(false);
-      try {
-        const result = await this._api.createSession(
-          workingDirectory,
-          initialMessage,
-          model.get_text().trim()
-        );
-        dialog.close();
-        await this.refresh();
-        const row = this._rows.get(result.id);
-        if (row) this._sessionList.select_row(row);
-        else await this._selectSession(result.id);
-      } catch (error) {
-        create.set_sensitive(true);
-        this._showToast(error.message || String(error));
+      menu.append_section(null, agents);
+    }
+    const runtime = new Gio.Menu();
+    if (backends.length) {
+      const backendMenu = new Gio.Menu();
+      for (const name of backends) backendMenu.append(name, `win.new-backend::${name}`);
+      runtime.append_submenu('Backend', backendMenu);
+    }
+    if (models.length) {
+      const modelMenu = new Gio.Menu();
+      modelMenu.append('Default', 'win.new-model::');
+      for (const model of models) {
+        modelMenu.append(model.display_name || model.id, `win.new-model::${model.id}`);
       }
-    });
-    dialog.present(this);
+      runtime.append_submenu('Model', modelMenu);
+    }
+    menu.append_section(null, runtime);
+    this._newConfig.set_menu_model(menu);
+
+    this.lookup_action('new-agent')?.set_state(GLib.Variant.new_string(this._newAgent));
+    this.lookup_action('new-backend')?.set_state(GLib.Variant.new_string(backend));
+    this.lookup_action('new-model')?.set_state(GLib.Variant.new_string(this._newModel));
+
+    const modelLabel = models.find(m => m.id === this._newModel)?.display_name ||
+      this._newModel;
+    const summary = this._newAgent ||
+      [backend, modelLabel].filter(Boolean).join(' · ') || 'Default';
+    this._newConfig.set_label(ellipsize(summary, 28));
+    this._title.set_subtitle(this._newAgent ? `agent: ${this._newAgent}` : '');
+  }
+
+  // Choosing an agent fills in what that agent has an opinion about; the
+  // fields stay editable, so anything changed afterwards is sent as an
+  // override.
+  _applyNewAgent(name) {
+    this._newAgent = name;
+    const profile = this._agentProfiles?.find(p => p.name === name);
+    if (profile) {
+      if (profile.cwd) this._newCwd.set_text(profile.cwd);
+      if (profile.backend) this._newBackend = profile.backend;
+      this._newModel = profile.model || '';
+      this._updatingAutoApprove = true;
+      this._autoApprove.set_active(Boolean(profile.auto_approve));
+      this._autoApprove.set_label(`Approve: ${profile.auto_approve ? 'auto' : 'ask'}`);
+      this._updatingAutoApprove = false;
+    }
+    this._syncNewConfig();
+  }
+
+  async _createSession(text) {
+    const request = {
+      cwd: this._newCwd.get_text().trim(),
+      initialMessage: text,
+      backend: this._newBackend,
+      model: this._newModel,
+      agent: this._newAgent,
+      autoApprove: this._autoApprove.get_active(),
+    };
+    // An agent can supply the working directory; without one it is required.
+    if (!request.cwd && !request.agent) {
+      this._showToast('Choose an agent or set a working directory');
+      return;
+    }
+    this._sendInFlight = true;
+    this._syncComposerActions();
+    try {
+      const result = await this._api.createSession(request);
+      this._leaveNewSession();
+      await this.refresh();
+      const row = this._sidebar.rows.get(result.id);
+      if (row) this._sidebar.select(row);
+      else await this._selectSession(result.id);
+    } catch (error) {
+      this._showToast(error.message || String(error));
+    } finally {
+      this._sendInFlight = false;
+      this._syncComposerActions();
+    }
+  }
+
+  // Unsent text belongs to the session it was typed for. Without this the
+  // composer carries it to whatever is opened next — and sends it there.
+  _stashDraft() {
+    if (this._newMode || !this._selectedId) return;
+    const buffer = this._prompt.get_buffer();
+    const text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), false);
+    if (text) this._drafts.set(this._selectedId, text);
+    else this._drafts.delete(this._selectedId);
+  }
+
+  _restoreDraft(id) {
+    this._prompt.get_buffer().set_text(this._drafts.get(id) || '', -1);
   }
 
   async _selectSession(id) {
+    this._stashDraft();
+    this._leaveNewSession();
+    this._restoreDraft(id);
     const epoch = ++this._selectionEpoch;
     this._selectedId = id;
     this._eventStream?.stop();
@@ -737,7 +1013,10 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._sendInFlight = false;
     this._transcriptStore.remove_all();
     this._setTurnRunning(false);
-    this._transcriptLimit = 100;
+    this._transcriptLimit = TRANSCRIPT_PAGE;
+    this._windowStart = 0;
+    this._transcriptTotal = 0;
+    this._loadingEarlier = false;
     this._status.set_title('Loading session…');
     this._status.set_description('');
     this._status.set_visible(true);
@@ -748,9 +1027,11 @@ class UsherWindow extends Adw.ApplicationWindow {
       const session = await this._api.getSession(id);
       if (this._selectionEpoch !== epoch || this._selectedId !== id) return;
       this._title.set_title(session.title || '(untitled)');
-      this._title.set_subtitle(this._displayText(`${session.backend} · ${session.cwd}`, 200));
+      this._title.set_subtitle(ellipsize(`${session.backend} · ${session.cwd}`, 200));
       this._currentSession = session;
       this._syncAutoApprove();
+      this._renderRuntime(session.runtime);
+      this._loadCommands(id, epoch);
       if (!await this._loadTranscript(id, epoch)) return;
       if (this._selectionEpoch !== epoch || this._selectedId !== id) return;
       this._status.set_visible(false);
@@ -765,232 +1046,42 @@ class UsherWindow extends Adw.ApplicationWindow {
       if (this._selectionEpoch !== epoch || this._selectedId !== id) return;
       this._selectionEpoch++;
       this._selectedId = null;
-      this._sessionList.unselect_all();
+      this._sidebar.unselectAll();
       this._syncSessionMenu();
       this._showError('Could not open session', error);
     }
   }
 
-  // Renders the selected session's pending interactions (tool permission
-  // requests and AskUserQuestion) above the composer, one at a time, mirroring
-  // the web UI. `list` is the full /api/interactions payload; a keyed
-  // comparison skips rebuilds so a poll can't yank buttons out from under a
-  // click.
+  // The server tags each interaction with a kind: "permission" is allow/deny,
+  // "choice" and "text" are answered by picking or typing. One of each can be
+  // pending at once. The keyed comparison skips rebuilds, or a poll would yank
+  // buttons out from under a click and clear half-typed answers.
   _updateInteractions(list) {
     this._pendingInteractions = list;
-    const here = this._selectedId
+    const mine = this._selectedId
       ? list.filter(p => p.session_id === this._selectedId)
       : [];
-    const key = here.map(p => p.id).join('\n');
+    const permissions = mine.filter(p => !this._interactions.isQuestion(p));
+    const questions = mine.filter(p => this._interactions.isQuestion(p));
+    const key = `${permissions[0]?.id || ''}|${questions[0]?.id || ''}`;
     if (key === this._interactionKey) return;
     this._interactionKey = key;
     let child;
     while ((child = this._permissionBox.get_first_child())) this._permissionBox.remove(child);
-    if (!here.length) {
+    if (!permissions.length && !questions.length) {
       this._permissionBox.set_visible(false);
       return;
     }
     this._permissionBox.set_visible(true);
-    this._permissionBox.append(this._interactionWidget(here[0], here.length));
-    this._scrollToBottom();
-  }
-
-  _interactionWidget(pending, total) {
-    const questions = pending.tool_name === 'AskUserQuestion' &&
-      Array.isArray(pending.tool_input?.questions) &&
-      pending.tool_input.questions.length > 0
-      ? pending.tool_input.questions : null;
-    const body = questions
-      ? this._askQuestionWidget(pending, questions)
-      : this._permissionWidget(pending, total);
-    body.set_margin_top(10);
-    body.set_margin_bottom(10);
-    body.set_margin_start(12);
-    body.set_margin_end(12);
-    const frame = new Gtk.Frame({ child: body, hexpand: true });
-    frame.add_css_class('card');
-    frame.add_css_class('permission-card');
-    return frame;
-  }
-
-  _permissionWidget(pending, total) {
-    const box = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6 });
-    const heading = new Gtk.Label({
-      label: `Permission: ${pending.tool_name || pending.event || 'tool'}` +
-        (total > 1 ? ` (1 of ${total})` : ''),
-      xalign: 0,
-      ellipsize: Pango.EllipsizeMode.END,
-    });
-    heading.add_css_class('heading');
-    box.append(heading);
-
-    let inputText = '';
-    try { inputText = JSON.stringify(pending.tool_input ?? {}, null, 2); }
-    catch (_) { inputText = String(pending.tool_input || ''); }
-    const input = new Gtk.Label({
-      label: this._displayText(inputText, 4000),
-      xalign: 0,
-      yalign: 0,
-      selectable: true,
-      wrap: true,
-      wrap_mode: Pango.WrapMode.WORD_CHAR,
-    });
-    input.add_css_class('monospace');
-    input.add_css_class('caption');
-    box.append(new Gtk.ScrolledWindow({
-      child: input,
-      hscrollbar_policy: Gtk.PolicyType.NEVER,
-      max_content_height: 150,
-      propagate_natural_height: true,
-      hexpand: true,
-    }));
-
-    const actions = new Gtk.Box({ spacing: 6, halign: Gtk.Align.END });
-    const deny = new Gtk.Button({ label: 'Deny' });
-    deny.add_css_class('destructive-action');
-    const buttons = [deny];
-    let always = null;
-    if (pending.allow_always) {
-      always = new Gtk.Button({ label: 'Always allow' });
-      buttons.push(always);
+    if (permissions.length) {
+      this._permissionBox.append(this._interactions.interactionCard(
+        this._interactions.permissionWidget(permissions[0], permissions.length)));
     }
-    const allow = new Gtk.Button({ label: 'Allow' });
-    allow.add_css_class('suggested-action');
-    buttons.push(allow);
-    for (const button of buttons) actions.append(button);
-    box.append(actions);
-
-    const respond = (behavior, scope) => this._respondInteraction(
-      pending.id,
-      { behavior, scope, reason: 'via usher GTK client' },
-      buttons
-    );
-    deny.connect('clicked', () => respond('deny', 'once'));
-    allow.connect('clicked', () => respond('allow', 'once'));
-    always?.connect('clicked', () => respond('allow', 'session'));
-    return box;
-  }
-
-  // AskUserQuestion renders as a choice picker instead of allow/deny: picked
-  // labels (or free text) go back as `answers`, which the server feeds into
-  // the tool's updatedInput. "Ignore" denies, which the agent treats as "skip
-  // the question, continue in chat".
-  _askQuestionWidget(pending, questions) {
-    const box = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 8 });
-    const heading = new Gtk.Label({ label: 'Question from the agent', xalign: 0 });
-    heading.add_css_class('heading');
-    box.append(heading);
-
-    const state = questions.map(() => ({ selected: new Set(), entry: null, buttons: [] }));
-    const answerFor = index => {
-      const typed = state[index].entry.get_text().trim();
-      if (typed) return typed;
-      // Join all selected labels — a single-select question has at most one.
-      return [...state[index].selected].sort((a, b) => a - b)
-        .map(i => questions[index].options?.[i]?.label || '')
-        .filter(Boolean)
-        .join(', ');
-    };
-    let submit = null;
-    const recompute = () => submit.set_sensitive(questions.every((_, i) => answerFor(i)));
-    let syncing = false;
-
-    questions.forEach((question, qi) => {
-      if (question.header) {
-        const header = new Gtk.Label({ label: question.header, xalign: 0 });
-        header.add_css_class('caption-heading');
-        header.add_css_class('dim-label');
-        box.append(header);
-      }
-      const text = new Gtk.Label({
-        label: (question.question || '') +
-          (question.multiSelect ? ' (select all that apply)' : ''),
-        xalign: 0,
-        wrap: true,
-        wrap_mode: Pango.WrapMode.WORD_CHAR,
-      });
-      box.append(text);
-
-      (question.options || []).forEach((option, oi) => {
-        const content = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 2 });
-        content.append(new Gtk.Label({ label: option.label || '', xalign: 0 }));
-        if (option.description) {
-          const description = new Gtk.Label({
-            label: option.description,
-            xalign: 0,
-            wrap: true,
-            wrap_mode: Pango.WrapMode.WORD_CHAR,
-          });
-          description.add_css_class('caption');
-          description.add_css_class('dim-label');
-          content.append(description);
-        }
-        const button = new Gtk.ToggleButton({ child: content });
-        state[qi].buttons.push(button);
-        button.connect('toggled', () => {
-          if (syncing) return;
-          syncing = true;
-          if (button.get_active()) {
-            if (!question.multiSelect) {
-              state[qi].selected.clear();
-              state[qi].buttons.forEach((b, i) => { if (i !== oi) b.set_active(false); });
-            }
-            state[qi].selected.add(oi);
-            state[qi].entry.set_text(''); // picking an option clears free text
-          } else {
-            state[qi].selected.delete(oi);
-          }
-          syncing = false;
-          recompute();
-        });
-        box.append(button);
-      });
-
-      const entry = new Gtk.Entry({
-        placeholder_text: 'Or type your own answer…',
-        hexpand: true,
-      });
-      state[qi].entry = entry;
-      entry.connect('changed', () => {
-        if (syncing) return;
-        if (entry.get_text().trim()) { // typing clears the option selection
-          syncing = true;
-          state[qi].selected.clear();
-          state[qi].buttons.forEach(b => b.set_active(false));
-          syncing = false;
-        }
-        recompute();
-      });
-      box.append(entry);
-    });
-
-    const actions = new Gtk.Box({ spacing: 6, halign: Gtk.Align.END });
-    const ignore = new Gtk.Button({ label: 'Ignore' });
-    submit = new Gtk.Button({ label: 'Answer', sensitive: false });
-    submit.add_css_class('suggested-action');
-    actions.append(ignore);
-    actions.append(submit);
-    box.append(actions);
-
-    ignore.connect('clicked', () => this._respondInteraction(
-      pending.id,
-      {
-        behavior: 'deny',
-        scope: 'once',
-        reason: 'The user declined to answer; continue in the conversation.',
-      },
-      [ignore, submit]
-    ));
-    submit.connect('clicked', () => {
-      const answers = {};
-      questions.forEach((question, qi) => { answers[question.question] = answerFor(qi); });
-      this._respondInteraction(
-        pending.id,
-        { behavior: 'allow', answers, reason: 'via usher GTK client' },
-        [ignore, submit]
-      );
-    });
-    return box;
+    if (questions.length) {
+      this._permissionBox.append(this._interactions.interactionCard(
+        this._interactions.questionWidget(questions[0], questions.length)));
+    }
+    this._scrollToBottom();
   }
 
   async _respondInteraction(id, payload, buttons) {
@@ -1005,8 +1096,170 @@ class UsherWindow extends Adw.ApplicationWindow {
     }
   }
 
+  // The backend's own command catalog (/model, /compact, …). A backend that
+  // cannot answer reports available:false, which is not an error — the
+  // composer simply offers no completions.
+  async _loadCommands(id, epoch) {
+    this._commands = [];
+    this._commandSigil = '/';
+    try {
+      const catalog = await this._api.listCommands(id);
+      if (this._selectionEpoch !== epoch || this._selectedId !== id) return;
+      if (catalog?.available) this._commands = catalog.commands || [];
+      this._commandSource = catalog?.source || '';
+    } catch (_) {
+      // Leave the composer without completions; sending still works.
+    }
+  }
+
+  // Codex exposes skills under a different sigil than commands.
+  _sigilFor(command) {
+    return this._commandSource === 'codex' && command.kind === 'skill' ? '$' : '/';
+  }
+
+  // The token being completed: the whole prompt, only while it is a single
+  // leading "/word" — the same rule the web composer uses, which keeps the
+  // popup out of the way of prose that merely contains a slash.
+  _commandToken() {
+    const buffer = this._prompt.get_buffer();
+    const text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), false);
+    const match = /^[/$]([\w:-]*)$/.exec(text);
+    return match ? match[1] : null;
+  }
+
+  _buildCommandPopup() {
+    this._commandList = new Gtk.ListBox({ selection_mode: Gtk.SelectionMode.SINGLE });
+    this._commandList.add_css_class('boxed-list');
+    this._commandList.connect('row-activated', (_list, row) => this._applyCommand(row.command));
+    const scroll = new Gtk.ScrolledWindow({
+      child: this._commandList,
+      hscrollbar_policy: Gtk.PolicyType.NEVER,
+      max_content_height: 260,
+      propagate_natural_height: true,
+    });
+    scroll.set_size_request(360, -1);
+    this._commandPopup = new Gtk.Popover({
+      child: scroll,
+      autohide: false,
+      has_arrow: false,
+      position: Gtk.PositionType.TOP,
+    });
+    this._commandPopup.set_parent(this._prompt);
+  }
+
+  _updateCommandPopup() {
+    const token = this._commandToken();
+    if (token === null || !this._commands?.length) {
+      this._commandPopup.popdown();
+      return;
+    }
+    const query = token.toLowerCase();
+    const matches = this._commands
+      .filter(command => command.name.toLowerCase().includes(query))
+      .slice(0, 12);
+    let child;
+    while ((child = this._commandList.get_first_child())) this._commandList.remove(child);
+    if (!matches.length) {
+      this._commandPopup.popdown();
+      return;
+    }
+    for (const command of matches) {
+      const row = new Adw.ActionRow({
+        title: `${this._sigilFor(command)}${command.name}`,
+        subtitle: command.description || '',
+      });
+      row.command = command;
+      this._commandList.append(row);
+    }
+    this._commandList.select_row(this._commandList.get_row_at_index(0));
+    this._commandPopup.popup();
+  }
+
+  _applyCommand(command) {
+    if (!command) return;
+    this._prompt.get_buffer().set_text(`${this._sigilFor(command)}${command.name} `, -1);
+    this._commandPopup.popdown();
+    this._prompt.grab_focus();
+  }
+
+  // Arrow keys and Tab/Enter drive the popup while it is up; everything else
+  // falls through to the text view.
+  _handleCommandKey(keyval) {
+    if (!this._commandPopup?.get_visible()) return false;
+    const selected = this._commandList.get_selected_row();
+    const index = selected ? selected.get_index() : 0;
+    const move = step => {
+      const count = [...this._commandRows()].length;
+      if (!count) return true;
+      const next = (index + step + count) % count;
+      this._commandList.select_row(this._commandList.get_row_at_index(next));
+      return true;
+    };
+    if (keyval === Gdk.KEY_Down) return move(1);
+    if (keyval === Gdk.KEY_Up) return move(-1);
+    if (keyval === Gdk.KEY_Escape) { this._commandPopup.popdown(); return true; }
+    if (keyval === Gdk.KEY_Tab || keyval === Gdk.KEY_Return) {
+      this._applyCommand(selected?.command);
+      return true;
+    }
+    return false;
+  }
+
+  *_commandRows() {
+    for (let i = 0; ; i++) {
+      const row = this._commandList.get_row_at_index(i);
+      if (!row) return;
+      yield row;
+    }
+  }
+
+  _renderRuntime(runtime) {
+    const context = Number(runtime?.context_tokens) || 0;
+    if (context <= 0) {
+      this._usage.set_visible(false);
+      return;
+    }
+    const window = Number(runtime?.context_window) || 0;
+    const percent = window > 0 ? Math.min(100, Math.round(context / window * 100)) : 0;
+    this._usage.set_visible(true);
+    this._usageLabel.set_label(window > 0 ? `${percent}%` : '—');
+    this._usage.set_tooltip_text(window > 0
+      ? `Context ${percent}% used` : 'Context limit unavailable');
+
+    let child;
+    while ((child = this._usageDetail.get_first_child())) this._usageDetail.remove(child);
+    const addRow = (name, value) => {
+      const row = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 18 });
+      const key = new Gtk.Label({ label: name, xalign: 0, hexpand: true });
+      key.add_css_class('dim-label');
+      row.append(key);
+      row.append(new Gtk.Label({ label: value, xalign: 1 }));
+      this._usageDetail.append(row);
+    };
+    if (runtime.model) addRow('Model', runtime.model);
+    if (runtime.effort) addRow('Effort', runtime.effort);
+    addRow('Context', window > 0
+      ? `${this._formatTokens(context)} / ${this._formatTokens(window)}`
+      : `${this._formatTokens(context)} / unavailable`);
+    if (window > 0) {
+      const bar = new Gtk.LevelBar({ min_value: 0, max_value: 100, value: percent });
+      bar.set_size_request(200, -1);
+      this._usageDetail.append(bar);
+    }
+  }
+
+  _formatTokens(count) {
+    if (count < 1000) return String(count);
+    if (count < 1000000) return `${(count / 1000).toFixed(count < 10000 ? 1 : 0)}k`.replace('.0', '');
+    return `${(count / 1000000).toFixed(1)}m`.replace('.0', '');
+  }
+
   _syncAutoApprove() {
-    const enabled = Boolean(this._currentSession?.auto_approve);
+    // In the new-session view the toggle is a preset for a session that does
+    // not exist yet, so it keeps whatever the user (or a chosen agent) set.
+    const enabled = this._newMode
+      ? this._autoApprove.get_active()
+      : Boolean(this._currentSession?.auto_approve);
     this._updatingAutoApprove = true;
     this._autoApprove.set_active(enabled);
     this._autoApprove.set_label(`Approve: ${enabled ? 'auto' : 'ask'}`);
@@ -1014,7 +1267,14 @@ class UsherWindow extends Adw.ApplicationWindow {
   }
 
   async _toggleAutoApprove() {
-    if (this._updatingAutoApprove || !this._selectedId || !this._currentSession) return;
+    if (this._updatingAutoApprove) return;
+    if (this._newMode) {
+      // Nothing to persist yet; it rides along with the create request.
+      this._autoApprove.set_label(
+        `Approve: ${this._autoApprove.get_active() ? 'auto' : 'ask'}`);
+      return;
+    }
+    if (!this._selectedId || !this._currentSession) return;
     const session = this._currentSession;
     const sessionId = this._selectedId;
     const enabled = this._autoApprove.get_active();
@@ -1034,7 +1294,7 @@ class UsherWindow extends Adw.ApplicationWindow {
   }
 
   async _chooseUpload() {
-    if (!this._selectedId) return;
+    if (!this._selectedId && !this._newMode) return;
     try {
       const file = await new Gtk.FileDialog({ title: 'Upload File' }).open(this, null);
       if (!file) return;
@@ -1042,7 +1302,10 @@ class UsherWindow extends Adw.ApplicationWindow {
       const [bytes] = await file.load_bytes_async(null);
       const filename = file.get_basename();
       const [contentType] = Gio.content_type_guess(filename, null);
-      const result = await this._api.upload(this._selectedId, filename, contentType, bytes);
+      // Before a session exists the file goes to the shared drafts directory;
+      // either way the prompt just carries the resulting path.
+      const result = await this._api.upload(
+        this._newMode ? null : this._selectedId, filename, contentType, bytes);
       const buffer = this._prompt.get_buffer();
       const current = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), false);
       const prefix = current && !current.endsWith('\n') ? '\n' : '';
@@ -1061,7 +1324,8 @@ class UsherWindow extends Adw.ApplicationWindow {
 
   async _loadTranscript(id, epoch = this._selectionEpoch) {
     const initialLoad = this._renderedTurns.length === 0;
-    const { turns, total } = await this._api.getTranscript(id, this._transcriptLimit);
+    const { turns, total, offset } = await this._api.getTranscript(
+      id, { limit: this._transcriptLimit });
     if (this._selectionEpoch !== epoch || this._selectedId !== id) return false;
     const incoming = (turns || []).map(turn => ({ key: this._turnKey(turn), turn }));
     let common = 0;
@@ -1069,27 +1333,57 @@ class UsherWindow extends Adw.ApplicationWindow {
            incoming[common].key === this._renderedTurns[common].key) {
       common++;
     }
+    // Everything past the common prefix goes, which is also how the live turn
+    // and the optimistic echo are reconciled away.
     while (this._transcriptStore.get_n_items() > common)
       this._transcriptStore.remove(common);
     this._renderedTurns.length = common;
+    this._optimisticTurn = null;
     this._liveTurn = null;
     for (let i = common; i < incoming.length; i++) {
       this._transcriptStore.append(new TranscriptItem(incoming[i].turn, incoming[i].key));
       this._renderedTurns.push(incoming[i]);
     }
     this._scrollToBottom(initialLoad);
-    this._loadEarlier.set_visible(total > incoming.length);
+    this._transcriptTotal = total;
+    this._windowStart = offset;
+    // Offset 0 means the window already reaches the first turn.
+    this._loadEarlier.set_visible(offset > 0);
     return true;
   }
 
+  // Inserts one page of older turns above what is rendered. The limit must
+  // grow by exactly what was prepended: _loadTranscript aligns both lists from
+  // their first turn, so a shorter window next time would drop this page.
   async _loadEarlierMessages() {
-    this._transcriptLimit += 200;
+    const id = this._selectedId;
+    const epoch = this._selectionEpoch;
+    if (!id || this._loadingEarlier || this._windowStart <= 0) return;
+    this._loadingEarlier = true;
     this._loadEarlier.set_sensitive(false);
     try {
-      await this._loadTranscript(this._selectedId);
+      const { turns, offset } = await this._api.getTranscript(
+        id, { limit: TRANSCRIPT_PAGE, before: this._windowStart });
+      if (this._selectionEpoch !== epoch || this._selectedId !== id) return;
+      if (!turns.length) {
+        this._windowStart = 0;
+        this._loadEarlier.set_visible(false);
+        return;
+      }
+      const entries = turns.map(turn => ({ key: this._turnKey(turn), turn }));
+      this._transcriptStore.splice(
+        0, 0, entries.map(e => new TranscriptItem(e.turn, e.key)));
+      this._renderedTurns.unshift(...entries);
+      this._windowStart = offset;
+      this._transcriptLimit += turns.length;
+      this._loadEarlier.set_visible(offset > 0);
+      // Put the turn that was at the top back at the top, so the inserted
+      // history does not yank the reader.
+      this._messages.scroll_to(entries.length, Gtk.ListScrollFlags.NONE, null);
     } catch (error) {
       this._showToast(error.message || String(error));
     } finally {
+      this._loadingEarlier = false;
       this._loadEarlier.set_sensitive(true);
     }
   }
@@ -1107,164 +1401,18 @@ class UsherWindow extends Adw.ApplicationWindow {
   // small sender header on every turn (bold name + dim timestamp), with
   // alignment and a tinted bubble as the secondary cue — user prompts sit
   // right-aligned in a bubble, assistant turns flow plainly at full width.
-  _turnHeader(name, ts, alignEnd) {
-    const header = new Gtk.Box({
-      orientation: Gtk.Orientation.HORIZONTAL,
-      spacing: 6,
-      halign: alignEnd ? Gtk.Align.END : Gtk.Align.START,
-    });
-    const who = new Gtk.Label({ label: name });
-    who.add_css_class('caption-heading');
-    who.add_css_class('dim-label');
-    header.append(who);
-    const time = new Date(ts || '');
-    if (!Number.isNaN(time.getTime())) {
-      const stamp = new Gtk.Label({
-        label: `${time.getHours()}:${String(time.getMinutes()).padStart(2, '0')}`,
-      });
-      stamp.add_css_class('caption');
-      stamp.add_css_class('dim-label');
-      header.append(stamp);
-    }
-    return header;
-  }
-
-  _agentName() {
-    const backend = this._currentSession?.backend || '';
-    return backend ? backend.charAt(0).toUpperCase() + backend.slice(1) : 'Assistant';
-  }
-
-  // A fork is a prefix copy of the transcript up to this turn — edit-copy is
-  // the closest icon Adwaita ships (there is no dedicated branch/fork glyph).
-  _forkButton(uuid) {
-    const button = new Gtk.Button({
-      icon_name: 'edit-copy-symbolic',
-      valign: Gtk.Align.CENTER,
-      tooltip_text: 'Fork the conversation from here',
-    });
-    button.add_css_class('flat');
-    button.add_css_class('dim-label');
-    button.connect('clicked', async () => {
-      button.set_sensitive(false);
-      try {
-        await this._forkTurn(uuid);
-      } finally {
-        button.set_sensitive(true);
-      }
-    });
-    return button;
-  }
-
   async _forkTurn(uuid) {
     if (!this._selectedId) return;
     try {
       const result = await this._api.fork(this._selectedId, uuid);
       await this.refresh();
-      const row = this._rows.get(result.id);
-      if (row) this._sessionList.select_row(row);
+      const row = this._sidebar.rows.get(result.id);
+      if (row) this._sidebar.select(row);
       else await this._selectSession(result.id);
       this._showToast('Forked to a new session');
     } catch (error) {
       this._showToast(error.message || String(error));
     }
-  }
-
-  _turnWidget(turn) {
-    const outer = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 4 });
-    outer.set_margin_top(6);
-    outer.set_margin_bottom(6);
-    outer.set_margin_start(12);
-    outer.set_margin_end(12);
-
-    if (turn.role === 'assistant') {
-      const header = this._turnHeader(this._agentName(), turn.ts, false);
-      if (turn.uuid && !turn.live) header.append(this._forkButton(turn.uuid));
-      outer.append(header);
-      const flow = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6 });
-      for (const part of turn.parts || []) {
-        if (part.type === 'tool') {
-          flow.append(this._toolWidget(part));
-        } else {
-          flow.append(markdown.render(part.content || ''));
-        }
-      }
-      if (turn.live && turn.previewText) {
-        const preview = markdown.render(turn.previewText);
-        preview.add_css_class('dim-label');
-        flow.append(preview);
-      }
-      if (turn.live && !flow.get_first_child()) {
-        const thinking = new Gtk.Label({ label: 'Thinking…', xalign: 0 });
-        thinking.add_css_class('dim-label');
-        flow.append(thinking);
-      }
-      outer.append(flow);
-    } else if (turn.role !== 'user' && turn.role !== 'assistant') {
-      // Context-compaction markers and similar system notices: a centered,
-      // dim, compact marker instead of a speech bubble.
-      const marker = new Gtk.Label({
-        label: turn.content || turn.role,
-        halign: Gtk.Align.CENTER,
-      });
-      marker.add_css_class('caption');
-      marker.add_css_class('dim-label');
-      outer.append(marker);
-    } else {
-      const name = turn.role === 'user' ? 'You' : (turn.role || 'You');
-      outer.append(this._turnHeader(name, turn.ts, true));
-      const inner = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6 });
-      inner.set_margin_top(8);
-      inner.set_margin_bottom(8);
-      inner.set_margin_start(12);
-      inner.set_margin_end(12);
-      inner.append(markdown.render(turn.content || ''));
-      const bubble = new Gtk.Box({ halign: Gtk.Align.END });
-      bubble.add_css_class('user-bubble');
-      bubble.append(inner);
-      // Keep the bubble clear of the left edge so even a long prompt still
-      // reads as right-aligned speech.
-      bubble.set_margin_start(48);
-      outer.append(bubble);
-    }
-    return new Adw.Clamp({
-      child: outer,
-      maximum_size: 900,
-      tightening_threshold: 700,
-    });
-  }
-
-  _toolWidget(part) {
-    const expander = new Gtk.Expander();
-    expander.set_label_widget(this._toolHeader(part));
-    expander.connect('notify::expanded', () => {
-      if (!expander.get_expanded() || expander.get_child()) return;
-      const body = markdown.render(part.content || '');
-      body.add_css_class('tool-body');
-      expander.set_child(body);
-    });
-    const frame = new Gtk.Frame({ child: expander, hexpand: true });
-    frame.add_css_class('tool-card');
-    if (/^(Edit|Write)$/i.test(part.toolName || '')) expander.set_expanded(true);
-    return frame;
-  }
-
-  _toolHeader(part) {
-    const full = `${part.toolName || 'Tool'}  ${part.toolTarget || ''}`.trim();
-    const label = new Gtk.Label({
-      label: this._displayText(full, 160),
-      tooltip_text: full,
-      xalign: 0,
-      ellipsize: Pango.EllipsizeMode.END,
-      max_width_chars: 80,
-      hexpand: true,
-    });
-    label.add_css_class('tool-header');
-    return label;
-  }
-
-  _displayText(value, limit) {
-    const text = String(value || '');
-    return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
   }
 
   _openEvents(id, epoch = this._selectionEpoch) {
@@ -1290,16 +1438,53 @@ class UsherWindow extends Adw.ApplicationWindow {
         }
         if (name === 'part') this._appendLivePart(data);
         if (name === 'part.delta') this._appendLiveDelta(data);
+        if (name === 'session.runtime') this._renderRuntime(data);
+        // The backend says it is reasoning before it emits anything to show.
+        if (name === 'turn.status' && data?.status === 'thinking') {
+          this._beginLiveTurn();
+          this._setLiveStatus('Thinking…');
+        }
       },
       (state, error) => this._setStreamState(state, error)
     );
     this._eventStream.start();
   }
 
+  // An unconfirmed echo of what was just sent. It carries no key, so the
+  // transcript diff in _loadTranscript treats it as surplus and drops it once
+  // the persisted turn arrives — the same reconciliation a live turn gets.
+  _appendOptimisticTurn(text) {
+    this._optimisticTurn = { role: 'user', content: text, ts: '', optimistic: true };
+    const index = this._liveTurn ? this._transcriptStore.get_n_items() - 1 : -1;
+    const item = new TranscriptItem(this._optimisticTurn, '__optimistic__');
+    if (index >= 0) this._transcriptStore.insert(index, item);
+    else this._transcriptStore.append(item);
+    this._scrollToBottom(true);
+  }
+
+  _removeOptimisticTurn() {
+    if (!this._optimisticTurn) return;
+    for (let i = this._transcriptStore.get_n_items() - 1; i >= 0; i--) {
+      if (this._transcriptStore.get_item(i).key === '__optimistic__') {
+        this._transcriptStore.remove(i);
+        break;
+      }
+    }
+    this._optimisticTurn = null;
+  }
+
   async _sendMessage() {
     // The in-flight guard matters for Ctrl+Enter, which bypasses the
     // desensitized send button.
-    if (!this._selectedId || this._sendInFlight) return;
+    if (this._sendInFlight) return;
+    if (this._newMode) {
+      const buffer = this._prompt.get_buffer();
+      const text = buffer.get_text(
+        buffer.get_start_iter(), buffer.get_end_iter(), false).trim();
+      if (text) await this._createSession(text);
+      return;
+    }
+    if (!this._selectedId) return;
     const id = this._selectedId;
     const epoch = this._selectionEpoch;
     const buffer = this._prompt.get_buffer();
@@ -1307,14 +1492,19 @@ class UsherWindow extends Adw.ApplicationWindow {
     if (!text) return;
     this._sendInFlight = true;
     this._syncComposerActions();
+    // The canonical turn replaces this echo when turn.user lands.
+    buffer.set_text('', -1);
+    this._drafts.delete(id);
+    this._appendOptimisticTurn(text);
     try {
       await this._api.send(id, text);
       if (this._selectionEpoch === epoch && this._selectedId === id) {
-        buffer.set_text('', -1);
         this._setTurnRunning(true);
       }
     } catch (error) {
       if (this._selectionEpoch === epoch && this._selectedId === id) {
+        this._removeOptimisticTurn();
+        buffer.set_text(text, -1); // hand the message back rather than lose it
         this._showToast(error.message || String(error));
       }
     } finally {
@@ -1341,14 +1531,20 @@ class UsherWindow extends Adw.ApplicationWindow {
 
   _setTurnRunning(running) {
     this._turnRunning = running;
+    // Paging in older turns mid-stream would rebuild the list under the live
+    // turn, so it waits until the turn is done.
+    this._loadEarlier.set_sensitive(!running);
     this._syncComposerActions();
   }
 
   _syncComposerActions() {
-    this._send.set_visible(!this._turnRunning);
-    this._send.set_sensitive(!this._turnRunning && !this._sendInFlight);
-    this._cancel.set_visible(this._turnRunning);
-    this._cancel.set_sensitive(this._turnRunning);
+    // Nothing is running in the new-session view, so send is always the
+    // action there — the stop button belongs to a turn that exists.
+    const running = this._turnRunning && !this._newMode;
+    this._send.set_visible(!running);
+    this._send.set_sensitive(!running && !this._sendInFlight);
+    this._cancel.set_visible(running);
+    this._cancel.set_sensitive(running);
   }
 
   _setStreamState(state, error = null) {
@@ -1368,18 +1564,61 @@ class UsherWindow extends Adw.ApplicationWindow {
     });
 
     // --- Local group ---
+    // Sandboxed builds cannot start anything on the host, so instead of a
+    // control that could only fail, the Local group explains how to run usher
+    // outside the sandbox and add it below as a server.
+    if (isSandboxed()) {
+      const sandboxGroup = new Adw.PreferencesGroup({ title: 'Local' });
+      if (errorMessage) sandboxGroup.set_description(errorMessage);
+      const explain = new Gtk.Label({
+        label: 'This build runs in a sandbox and cannot start usher for you.\n\n' +
+          'Run it yourself on this machine:\n' +
+          '    usher serve\n\n' +
+          'then add http://127.0.0.1:7777 as a remote server below. ' +
+          'If you have set a password, usher will ask for it.',
+        xalign: 0,
+        wrap: true,
+        wrap_mode: Pango.WrapMode.WORD_CHAR,
+        selectable: true,
+        // Selectable so the command can be copied, but not focusable: as the
+        // dialog's first focusable widget it would open with everything
+        // highlighted.
+        can_focus: false,
+      });
+      explain.set_margin_top(12);
+      explain.set_margin_bottom(12);
+      explain.set_margin_start(12);
+      explain.set_margin_end(12);
+      const frame = new Gtk.Frame({ child: explain });
+      frame.add_css_class('card');
+      sandboxGroup.add(frame);
+      page.add(sandboxGroup);
+      return this._addRemoteGroup(dialog, page);
+    }
+
     const localGroup = new Adw.PreferencesGroup({ title: 'Local' });
     if (errorMessage) localGroup.set_description(errorMessage);
     const pathRow = new Adw.EntryRow({ title: 'Binary path' });
     pathRow.set_text(this._servers.embeddedPath);
     localGroup.add(pathRow);
+    const portRow = new Adw.SpinRow({
+      title: 'Port',
+      subtitle: `usher's own default is 7777; this one defaults to ${DEFAULT_EMBEDDED_PORT}`,
+      adjustment: new Gtk.Adjustment({
+        lower: 1, upper: 65535, step_increment: 1, page_increment: 100,
+        value: this._servers.embeddedPort,
+      }),
+    });
+    localGroup.add(portRow);
+    const address = () => `127.0.0.1:${portRow.get_value()}`;
 
     const isEmbeddedActive = this._currentServer?.id === '__embedded__' && this._started;
     const startRow = new Adw.ActionRow({
       title: isEmbeddedActive ? 'Embedded usher' : 'Start embedded usher',
-      subtitle: isEmbeddedActive
-        ? '127.0.0.1:17777 · Connected'
-        : '127.0.0.1:17777',
+      subtitle: isEmbeddedActive ? `${address()} · Connected` : address(),
+    });
+    portRow.connect('notify::value', () => {
+      if (!isEmbeddedActive) startRow.set_subtitle(address());
     });
     if (isEmbeddedActive) {
       startRow.add_prefix(new Gtk.Image({
@@ -1397,26 +1636,48 @@ class UsherWindow extends Adw.ApplicationWindow {
     startButton.connect('clicked', async () => {
       const path = pathRow.get_text().trim();
       if (!path) { pathRow.grab_focus(); return; }
+      const port = Math.round(portRow.get_value());
       this._servers.setEmbeddedPath(path);
+      this._servers.setEmbeddedPort(port);
       startButton.set_sensitive(false);
       startRow.set_subtitle('Starting…');
-      const ok = await this._connectTo({
+      const config = {
         id: '__embedded__',
         name: 'Embedded usher',
         url: '',
         binaryPath: path,
-      });
-      if (ok) {
+        port,
+      };
+      const result = await this._connectTo(config);
+      if (result === true) {
         this._servers.selectEmbedded();
+        if (this._backend.adopted) {
+          this._showToast('Connected to the usher already running on this port');
+        }
         dialog.close();
-      } else {
-        startButton.set_sensitive(true);
-        startRow.set_subtitle('Connection failed');
+        return;
       }
+      startButton.set_sensitive(true);
+      if (result === 'auth') {
+        // Something was already listening and it is not ours to authenticate
+        // to from disk, so it takes a password like any other server.
+        startRow.set_subtitle('Password required');
+        this._promptPassword({ ...config, name: 'usher on this port' }, dialog);
+        return;
+      }
+      // The reason arrives as a toast from _connectTo; the row keeps a marker
+      // in case that toast is missed.
+      startRow.set_subtitle(`${address()} · not started`);
     });
     localGroup.add(startRow);
     page.add(localGroup);
 
+    this._addRemoteGroup(dialog, page);
+  }
+
+  // Shared by the ordinary dialog and the sandboxed one, which has no
+  // local group to offer.
+  _addRemoteGroup(dialog, page) {
     // --- Remote group ---
     const remoteGroup = new Adw.PreferencesGroup({ title: 'Remote' });
     for (const server of this._servers.servers) {
@@ -1447,6 +1708,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       deleteBtn.add_css_class('flat');
       deleteBtn.connect('clicked', () => {
         const wasCurrent = this._currentServer?.id === server.id;
+        clearPassword(server.id);
         this._servers.remove(server.id);
         remoteGroup.remove(row);
         if (wasCurrent) this._disconnect();
@@ -1553,10 +1815,11 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._title.set_subtitle('Connecting…');
     try {
       await this._backend.ensureRunning();
-      if (serverConfig.id === '__embedded__' && !password) {
-        const cookie = deriveAuthCookie();
-        if (cookie) this._api.setAuthCookie(cookie);
+      // A password kept from an earlier session spares the user retyping it.
+      if (!password && serverConfig.id) {
+        password = await lookupPassword(serverConfig.id);
       }
+      if (!password) this._authenticateOwnBackend();
       if (password) await this._api.login(password);
       const sessions = await this._api.listSessions();
       if (serverConfig.id === '__embedded__') {
@@ -1566,8 +1829,9 @@ class UsherWindow extends Adw.ApplicationWindow {
         this._servers.select(saved.id);
         serverConfig = saved;
       }
+      if (password) storePassword(serverConfig.id, password, serverConfig.name);
       this._currentServer = serverConfig;
-      this._sessionsDigest = null;
+      this._sidebar.sessionsDigest = null;
       this._renderSessions(sessions || []);
       this._interactionKey = null;
       this._updateInteractions([]);
@@ -1578,6 +1842,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._composer.set_visible(false);
       this._started = true;
       this._title.set_subtitle(serverConfig.name || this._backend.baseUrl);
+      this._loadServerConfig();
       return true;
     } catch (error) {
       // Point the client back at the previously working server so the
@@ -1640,14 +1905,12 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._currentServer = null;
     this._started = false;
     this._selectedId = null;
-    this._sessionsDigest = null;
-    this._sessionsById = new Map();
+    this._sidebar.sessionsDigest = null;
+    this._sidebar.sessionsById = new Map();
     this._interactionKey = null;
     this._updateInteractions([]);
     this._syncSessionMenu();
-    let child;
-    while ((child = this._sessionList.get_first_child())) this._sessionList.remove(child);
-    this._rows.clear();
+    this._sidebar.clear();
     this._showError('Disconnected', new Error('Select a server to connect.'));
   }
 
@@ -1664,10 +1927,38 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._scrollToBottom();
   }
 
+  // Rebuilds every rendered turn from the data already held, which is what
+  // switching between rendered and raw markdown needs; the factory builds the
+  // widgets afresh for the replacement items.
+  _rerenderTranscript() {
+    this._transcriptStore.remove_all();
+    for (const item of this._renderedTurns) {
+      this._transcriptStore.append(new TranscriptItem(item.turn, item.key));
+    }
+    if (this._optimisticTurn) {
+      this._transcriptStore.append(
+        new TranscriptItem(this._optimisticTurn, '__optimistic__'));
+    }
+    if (this._liveTurn) {
+      this._transcriptStore.append(new TranscriptItem(this._liveTurn, '__live__'));
+    }
+  }
+
+  // Replaces the live turn's placeholder text while it has nothing to show.
+  _setLiveStatus(status) {
+    if (!this._liveTurn || this._liveTurn.parts.length) return;
+    this._liveTurn.status = status;
+    this._refreshLiveTurn();
+  }
+
   _appendUserTurn(data) {
     if (!data?.content) return;
     const turn = { role: 'user', content: data.content, ts: data.ts || '' };
     const key = this._turnKey(turn);
+    // This is the canonical version of what was echoed on send: drop the echo
+    // rather than show the message twice. A prompt from another frontend has
+    // no echo to adopt and simply renders.
+    if (this._optimisticTurn?.content === data.content) this._removeOptimisticTurn();
     if (this._renderedTurns.some(item => item.key === key)) return;
     const item = new TranscriptItem(turn, key);
     const liveIndex = this._liveTurn ? this._transcriptStore.get_n_items() - 1 : -1;
@@ -1751,9 +2042,12 @@ class UsherWindow extends Adw.ApplicationWindow {
 
   _applyScrollToBottom() {
     const count = this._transcriptStore.get_n_items();
+    // scroll_to realizes the last row, which a virtualized list may not have
+    // measured yet; the adjustment then lands on the true bottom. Both are
+    // needed: scroll_to alone only brings the row's *top* into view, leaving
+    // the end of a row taller than the viewport (images, long answers) unseen.
     if (count > 0 && typeof this._messages.scroll_to === 'function') {
       this._messages.scroll_to(count - 1, Gtk.ListScrollFlags.NONE, null);
-      return;
     }
     const adjustment = this._chatScroll.get_vadjustment();
     adjustment.set_value(Math.max(0, adjustment.get_upper() - adjustment.get_page_size()));
@@ -1770,12 +2064,15 @@ class UsherWindow extends Adw.ApplicationWindow {
 
   _showToast(message) {
     this._toastOverlay.add_toast(new Adw.Toast({
-      title: this._displayText(String(message).replace(/\s+/g, ' '), 240),
+      title: ellipsize(String(message).replace(/\s+/g, ' '), 240),
       timeout: 4,
     }));
   }
 
   vfunc_close_request() {
+    // A popover with set_parent() is not owned by the widget tree; without an
+    // explicit unparent GTK warns about it at teardown.
+    this._commandPopup?.unparent();
     if (this._pollId) {
       GLib.source_remove(this._pollId);
       this._pollId = 0;

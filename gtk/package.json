@@ -1,0 +1,12 @@
+{
+  "name": "usher-gtk-dev",
+  "private": true,
+  "description": "Development tooling only. Neither building nor running the app needs npm.",
+  "scripts": {
+    "lint": "eslint src tests"
+  },
+  "devDependencies": {
+    "eslint": "^9.0.0"
+  },
+  "type": "module"
+}

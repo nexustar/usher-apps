@@ -5,11 +5,66 @@
   <summary>Manage local coding-agent sessions</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
-  <description>
-    <p>A native GNOME client for viewing and controlling Claude Code and Codex sessions through usher.</p>
-  </description>
-  <launchable type="desktop-id">io.github.nexustar.Usher.desktop</launchable>
-  <url type="homepage">https://github.com/nexustar/usher</url>
-  <content_rating type="oars-1.1"/>
-</component>
+  <developer id="io.github.nexustar">
+    <name>nexustar</name>
+  </developer>
 
+  <description>
+    <p>
+      A native GNOME client for usher, which routes and renders the coding-agent
+      sessions running on your machine — Claude Code, Codex, and pi.
+    </p>
+    <p>Browse and steer sessions from the desktop:</p>
+    <ul>
+      <li>Every session on the host, grouped by working directory</li>
+      <li>Live transcripts with collapsible tool calls and inline images</li>
+      <li>Send messages, interrupt a turn, and fork a conversation</li>
+      <li>Answer permission prompts and agent questions without leaving the app</li>
+      <li>Agent profiles and scheduled tasks for the connected server</li>
+    </ul>
+    <p>
+      usher itself runs separately, on this machine or another one; this client
+      connects to it over HTTP.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.nexustar.Usher.desktop</launchable>
+
+  <!-- TODO before submitting to Flathub: screenshots are required there.
+       Generate them from fabricated sessions — never a real transcript — save
+       them under gtk/data/screenshots/, then uncomment this block.
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/nexustar/usher-apps/main/gtk/data/screenshots/conversation.png</image>
+      <caption>A session transcript with tool calls and the composer</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/nexustar/usher-apps/main/gtk/data/screenshots/new-session.png</image>
+      <caption>Starting a session, with an agent, backend, and model to choose from</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/nexustar/usher-apps/main/gtk/data/screenshots/settings.png</image>
+      <caption>Agent profiles and scheduled tasks</caption>
+    </screenshot>
+  </screenshots>
+  -->
+
+  <url type="homepage">https://github.com/nexustar/usher</url>
+  <url type="bugtracker">https://github.com/nexustar/usher-apps/issues</url>
+  <url type="vcs-browser">https://github.com/nexustar/usher-apps</url>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#c0dcf5</color>
+    <color type="primary" scheme_preference="dark">#1c3552</color>
+  </branding>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.0" date="2026-08-02">
+      <description>
+        <p>First release of the GTK client.</p>
+      </description>
+    </release>
+  </releases>
+</component>

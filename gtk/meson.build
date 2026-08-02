@@ -5,11 +5,16 @@ dependency('gtksourceview-5', version: '>= 5.0')
 app_id = 'io.github.nexustar.Usher'
 app_name = 'usher'
 
+usher_backend = get_option('usher_backend')
+bundled_backend = ''
+if usher_backend != ''
+  bundled_backend = get_option('prefix') / get_option('libexecdir') / 'usher' / 'usher'
+endif
+
 subdir('src')
 subdir('data')
 subdir('tests')
 
-usher_backend = get_option('usher_backend')
 if usher_backend != ''
   install_data(
     usher_backend,

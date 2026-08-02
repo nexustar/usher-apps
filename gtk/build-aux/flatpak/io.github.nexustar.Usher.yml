@@ -1,0 +1,32 @@
+# No backend is bundled: starting one from the sandbox would need
+# --talk-name=org.freedesktop.Flatpak. The app detects the sandbox and points
+# the user at `usher serve`.
+id: io.github.nexustar.Usher
+runtime: org.gnome.Platform
+# Floor is 47: libadwaita 1.6, for AdwButtonRow.
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: usher-gtk
+
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  - --share=network
+
+modules:
+  - name: usher-gtk
+    buildsystem: meson
+    subdir: gtk
+    sources:
+      - type: git
+        url: https://github.com/nexustar/usher-apps.git
+        # Point at the tag being published. To build the working tree instead:
+        #   - type: dir
+        #     path: ../../..
+        tag: v0.1.0
+        commit: '0000000000000000000000000000000000000000'
+        x-checker-data:
+          type: git
+          tag-pattern: ^v([\d.]+)$

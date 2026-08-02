@@ -59,29 +59,97 @@ export class ApiClient {
     return bytes;
   }
 
+  // Archived roots and read-only subagents come along; the sidebar decides
+  // what to show, the way the web client does.
   listSessions() {
-    return this.request('GET', '/api/sessions?include_archived=1');
+    return this.request('GET', '/api/sessions?include_archived=1&include_subagents=1');
   }
 
-  createSession(cwd, initialMessage, model = '') {
+  // Every field but the message is optional; an agent profile supplies the
+  // defaults for whatever is left empty.
+  createSession({ cwd, initialMessage, model, backend, agent, autoApprove }) {
     return this.request('POST', '/api/sessions', {
-      cwd,
-      initial_message: initialMessage,
-      model,
+      cwd: cwd || '',
+      initial_message: initialMessage || '',
+      model: model || '',
+      backend: backend || '',
+      agent: agent || '',
+      auto_approve: Boolean(autoApprove),
     });
+  }
+
+  // { backends: [name], models: { backend: [{id, display_name}] } }
+  listModels() {
+    return this.request('GET', '/api/models');
+  }
+
+  // { editor_url } — the template for the session menu's editor entry.
+  getConfig() {
+    return this.request('GET', '/api/config');
+  }
+
+  // { source, available, commands: [{name, kind, description}] }. Only trust
+  // commands when available is true; a backend that cannot answer says so
+  // rather than reporting an empty catalog.
+  listCommands(id) {
+    return this.request('GET', `/api/sessions/${encodeURIComponent(id)}/commands`);
+  }
+
+  // Starts an idle worker without adding a user turn.
+  resumeSession(id) {
+    return this.request('POST', `/api/sessions/${encodeURIComponent(id)}/resume`);
+  }
+
+  listAgents() {
+    return this.request('GET', '/api/agents');
+  }
+
+  createAgent(profile) {
+    return this.request('POST', '/api/agents', profile);
+  }
+
+  updateAgent(name, profile) {
+    return this.request('PUT', `/api/agents/${encodeURIComponent(name)}`, profile);
+  }
+
+  deleteAgent(name) {
+    return this.request('DELETE', `/api/agents/${encodeURIComponent(name)}`);
+  }
+
+  // { schedules: [task + next_run], timezone }
+  listSchedules() {
+    return this.request('GET', '/api/schedules');
+  }
+
+  createSchedule(task) {
+    return this.request('POST', '/api/schedules', task);
+  }
+
+  updateSchedule(id, task) {
+    return this.request('PUT', `/api/schedules/${encodeURIComponent(id)}`, task);
+  }
+
+  deleteSchedule(id) {
+    return this.request('DELETE', `/api/schedules/${encodeURIComponent(id)}`);
+  }
+
+  runSchedule(id) {
+    return this.request('POST', `/api/schedules/${encodeURIComponent(id)}/run`);
   }
 
   getSession(id) {
     return this.request('GET', `/api/sessions/${encodeURIComponent(id)}`);
   }
 
-  // Unlike request(), this needs the X-Transcript-Total response header (the
-  // full turn count before the `limit` trim), so it cannot go through the
-  // header-discarding generic path.
-  async getTranscript(id, limit = 100) {
+  // A window of a session's turns. `before` is the exclusive upper bound in
+  // absolute turn indices (negative asks for the newest); the returned offset
+  // is the window's first index, so 0 means all history is loaded. The counts
+  // ride in headers, which the generic path discards.
+  async getTranscript(id, { limit = 100, before = -1 } = {}) {
+    const query = `?limit=${limit}` + (before >= 0 ? `&before=${before}` : '');
     const message = Soup.Message.new(
       'GET',
-      `${this.baseUrl}/api/sessions/${encodeURIComponent(id)}/transcript?limit=${limit}`
+      `${this.baseUrl}/api/sessions/${encodeURIComponent(id)}/transcript${query}`
     );
     const bytes = await this._sendAndRead(message);
     const text = new TextDecoder().decode(bytes.get_data());
@@ -94,12 +162,36 @@ export class ApiClient {
       const detail = payload?.error || `HTTP ${message.status_code}`;
       throw new ApiError(message.status_code, detail);
     }
-    const total = parseInt(message.get_response_headers().get_one('X-Transcript-Total') || '', 10);
-    return { turns: payload || [], total: Number.isFinite(total) ? total : (payload || []).length };
+    const headers = message.get_response_headers();
+    const turns = payload || [];
+    const total = parseInt(headers.get_one('X-Transcript-Total') || '', 10);
+    const offset = parseInt(headers.get_one('X-Transcript-Offset') || '', 10);
+    const count = Number.isFinite(total) ? total : turns.length;
+    return {
+      turns,
+      total: count,
+      offset: Number.isFinite(offset) ? offset : Math.max(0, count - turns.length),
+    };
   }
 
   fork(id, afterUUID) {
     return this.request('POST', `/api/sessions/${encodeURIComponent(id)}/fork`, { after_uuid: afterUUID });
+  }
+
+  // Raw bytes of an image referenced by this session's transcript. The server
+  // resolves the path against the session cwd (plus its attachment and
+  // generated-image directories) and refuses anything outside them.
+  async imageBytes(id, path) {
+    const message = Soup.Message.new(
+      'GET',
+      `${this.baseUrl}/api/sessions/${encodeURIComponent(id)}/image` +
+        `?path=${encodeURIComponent(path)}`
+    );
+    const bytes = await this._sendAndRead(message);
+    if (message.status_code < 200 || message.status_code >= 300) {
+      throw new ApiError(message.status_code, `HTTP ${message.status_code}`);
+    }
+    return bytes;
   }
 
   send(id, text) {
@@ -136,10 +228,15 @@ export class ApiClient {
     );
   }
 
+  // Uploads into a session's attachment directory, or — with a null id — into
+  // the shared drafts directory, which is how a file can be attached to a
+  // session that does not exist yet.
   async upload(id, filename, contentType, bytes) {
     const message = Soup.Message.new(
       'POST',
-      `${this.baseUrl}/api/sessions/${encodeURIComponent(id)}/upload`
+      id === null
+        ? `${this.baseUrl}/api/uploads`
+        : `${this.baseUrl}/api/sessions/${encodeURIComponent(id)}/upload`
     );
     const multipart = Soup.Multipart.new('multipart/form-data');
     multipart.append_form_file('file', filename, contentType || null, bytes);

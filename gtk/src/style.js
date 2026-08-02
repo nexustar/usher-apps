@@ -75,6 +75,11 @@ const CSS = `
   border-radius: 8px;
 }
 
+/* Inline transcript images: same 4px content-block radius as tool cards. */
+.transcript-image picture {
+  border-radius: 4px;
+}
+
 .markdown-table-grid {
   background-color: alpha(currentColor, 0.12);
 }

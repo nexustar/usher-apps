@@ -3,18 +3,42 @@ import GLib from 'gi://GLib';
 const CONFIG_DIR = GLib.build_filenamev([GLib.get_user_config_dir(), 'usher-app']);
 const CONFIG_FILE = GLib.build_filenamev([CONFIG_DIR, 'servers.json']);
 
+// usher's own default is 7777, so a backend this app starts sits elsewhere and
+// cannot collide with one the user runs themselves.
+export const DEFAULT_EMBEDDED_PORT = 17777;
+
+// A package that ships its own backend puts the path here (see the launcher).
+// That binary is the one such a build runs: no other install is searched for,
+// so the client and the server it drives cannot fall out of step.
+function bundledBackend() {
+  // Nothing on the host can be started from a sandbox, bundled or not.
+  if (GLib.file_test('/.flatpak-info', GLib.FileTest.EXISTS) ||
+      GLib.getenv('FLATPAK_ID')) {
+    return '';
+  }
+  const path = GLib.getenv('USHER_BUNDLED_BACKEND') || '';
+  return path && GLib.file_test(path, GLib.FileTest.IS_EXECUTABLE) ? path : '';
+}
+
 export class ServerStore {
   constructor() {
     this.servers = [];
     this.activeId = '';
-    this.embeddedPath = '';
+    this.embeddedPath = bundledBackend();
+    this.embeddedPort = DEFAULT_EMBEDDED_PORT;
     this._load();
   }
 
   get active() {
     if (this.activeId === '__embedded__') {
       return this.embeddedPath
-        ? { id: '__embedded__', name: 'Embedded usher', url: '', binaryPath: this.embeddedPath }
+        ? {
+            id: '__embedded__',
+            name: 'Embedded usher',
+            url: '',
+            binaryPath: this.embeddedPath,
+            port: this.embeddedPort,
+          }
         : null;
     }
     return this.servers.find(server => server.id === this.activeId) || null;
@@ -26,6 +50,13 @@ export class ServerStore {
 
   setEmbeddedPath(path) {
     this.embeddedPath = path.trim();
+    this._save();
+  }
+
+  setEmbeddedPort(port) {
+    const value = Number(port);
+    this.embeddedPort = Number.isInteger(value) && value > 0 && value < 65536
+      ? value : DEFAULT_EMBEDDED_PORT;
     this._save();
   }
 
@@ -69,10 +100,12 @@ export class ServerStore {
       if (Array.isArray(data.servers)) this.servers = data.servers;
       if (typeof data.activeId === 'string') this.activeId = data.activeId;
       if (typeof data.embeddedPath === 'string') this.embeddedPath = data.embeddedPath;
+      if (Number.isInteger(data.embeddedPort)) this.embeddedPort = data.embeddedPort;
     } catch (_) {
       this.servers = [];
       this.activeId = '';
-      this.embeddedPath = '';
+      this.embeddedPath = bundledBackend();
+      this.embeddedPort = DEFAULT_EMBEDDED_PORT;
     }
   }
 
@@ -81,6 +114,7 @@ export class ServerStore {
     GLib.file_set_contents(CONFIG_FILE, JSON.stringify({
       activeId: this.activeId,
       embeddedPath: this.embeddedPath,
+      embeddedPort: this.embeddedPort,
       servers: this.servers,
     }, null, 2));
   }

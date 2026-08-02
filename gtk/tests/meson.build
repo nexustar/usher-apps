@@ -1,4 +1,10 @@
 test(
+  'unit',
+  find_program('gjs'),
+  args: ['-m', meson.current_source_dir() / 'unit.js'],
+)
+
+test(
   'server-store',
   find_program('gjs'),
   args: ['-m', meson.current_source_dir() / 'server-store.js'],
@@ -37,6 +43,20 @@ if test_url != ''
     switch_env.set('USHER_BASE_URL', test_url)
     switch_env.set('GDK_BACKEND', 'broadway')
     switch_env.set('BROADWAY_DISPLAY', test_display)
+    behaviour_env = environment()
+    behaviour_env.set('USHER_TEST_URL', test_url)
+    behaviour_env.set('USHER_TEST_PASSWORD', get_option('test_password'))
+    behaviour_env.set('GDK_BACKEND', 'broadway')
+    behaviour_env.set('BROADWAY_DISPLAY', test_display)
+    test(
+      'behaviour',
+      find_program('gjs'),
+      args: ['-m', meson.current_source_dir() / 'behaviour.js'],
+      env: behaviour_env,
+      suite: 'integration',
+      timeout: 120,
+    )
+
     test(
       'session-switch-smoke',
       find_program('gjs'),

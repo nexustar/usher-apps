@@ -119,7 +119,7 @@ function codeBlock(token) {
   return frame;
 }
 
-function listBlock(token) {
+function listBlock(token, options) {
   const list = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 2 });
   const start = Number(token.start) || 1;
   for (let index = 0; index < (token.items || []).length; index++) {
@@ -130,10 +130,19 @@ function listBlock(token) {
       xalign: 1,
       yalign: 0,
     }));
-    row.append(renderTokens(item.tokens || []));
+    row.append(renderTokens(item.tokens || [], options));
     list.append(row);
   }
   return list;
+}
+
+// A paragraph holding nothing but one image becomes a real picture; an image
+// mixed into a sentence stays an inline text link, because Pango markup has no
+// way to host a widget mid-line. Returns the lone image token, or null.
+function loneImage(token) {
+  const tokens = (token.tokens || [])
+    .filter(child => !(child.type === 'text' && !String(child.text || '').trim()));
+  return tokens.length === 1 && tokens[0].type === 'image' ? tokens[0] : null;
 }
 
 function tableBlock(token) {
@@ -177,22 +186,25 @@ function tableBlock(token) {
   return scroll;
 }
 
-function block(token) {
+function block(token, options) {
   switch (token.type) {
     case 'paragraph':
-    case 'text':
-      return labelFor(token);
+    case 'text': {
+      const image = options.image && loneImage(token);
+      const widget = image && options.image(image.href, image.text || '');
+      return widget || labelFor(token);
+    }
     case 'heading': {
       const heading = labelFor(token);
       heading.set_markup(`<span weight="semibold">${inline(token.tokens)}</span>`);
       heading.add_css_class('markdown-heading');
       return heading;
     }
-    case 'list': return listBlock(token);
+    case 'list': return listBlock(token, options);
     case 'table': return tableBlock(token);
     case 'code': return codeBlock(token);
     case 'blockquote': {
-      const frame = new Gtk.Frame({ child: renderTokens(token.tokens || []) });
+      const frame = new Gtk.Frame({ child: renderTokens(token.tokens || [], options) });
       frame.add_css_class('markdown-quote');
       return frame;
     }
@@ -200,22 +212,25 @@ function block(token) {
     case 'html': return labelFor({ text: token.raw || token.text || '' });
     case 'space': return null;
     default:
-      if (token.tokens) return renderTokens(token.tokens);
+      if (token.tokens) return renderTokens(token.tokens, options);
       return labelFor(token);
   }
 }
 
-function renderTokens(tokens) {
+function renderTokens(tokens, options) {
   const box = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6, hexpand: true });
   for (const token of tokens) {
-    const widget = block(token);
+    const widget = block(token, options);
     if (widget) box.append(widget);
   }
   return box;
 }
 
-export function render(text) {
-  const widget = renderTokens(marked.lexer(String(text || '')));
+// options.image(href, alt) may return a widget for a standalone image, or a
+// falsy value to leave it as text. Keeping it a callback is what lets this
+// module stay free of any API-client or session knowledge.
+export function render(text, options = {}) {
+  const widget = renderTokens(marked.lexer(String(text || '')), options);
   widget.add_css_class('markdown-body');
   return widget;
 }

@@ -5,10 +5,16 @@ js_sources = files(
   'api-client.js',
   'backend-process.js',
   'event-stream.js',
+  'interaction.js',
+  'keyring.js',
   'local-auth.js',
   'markdown.js',
   'server-store.js',
+  'settings.js',
+  'sidebar.js',
+  'text.js',
   'style.js',
+  'transcript.js',
   'window.js',
 )
 
@@ -28,6 +34,7 @@ gjs = find_program('gjs').full_path()
 dev_launcher_conf = configuration_data()
 dev_launcher_conf.set('GJS', gjs)
 dev_launcher_conf.set('JS_DIR', meson.current_source_dir())
+dev_launcher_conf.set('BUNDLED_BACKEND', '')
 
 configure_file(
   input: 'usher-gtk.in',
@@ -41,6 +48,7 @@ installed_launcher_conf.set(
   'JS_DIR',
   get_option('prefix') / get_option('datadir') / app_id / 'js',
 )
+installed_launcher_conf.set('BUNDLED_BACKEND', bundled_backend)
 
 installed_launcher = configure_file(
   input: 'usher-gtk.in',

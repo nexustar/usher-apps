@@ -37,13 +37,13 @@ const actions = window._sessionActionsPopover(sessions[0]);
 if (!actions.get_child()) {
   throw new Error('session action menu was not constructed');
 }
-const toolWidget = window._toolWidget({
+const toolWidget = window._transcript.toolWidget({
   type: 'tool', toolName: 'Read', toolTarget: '/tmp/example.js',
   content: '```js\nconst answer = 42;\n```',
 });
 if (!toolWidget.has_css_class('tool-card')) throw new Error('tool card style was not applied');
 const archived = sessions.find(session => session.archived);
-if (archived && !window._rows.get(archived.id).get_sensitive()) {
+if (archived && !window._sidebar.rows.get(archived.id).get_sensitive()) {
   throw new Error('archived session row is not selectable');
 }
 

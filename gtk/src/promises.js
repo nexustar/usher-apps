@@ -1,4 +1,5 @@
 import Gio from 'gi://Gio';
+import Secret from 'gi://Secret';
 import Soup from 'gi://Soup?version=3.0';
 
 // GI async methods require callbacks by default. Promisify the small set used
@@ -22,6 +23,14 @@ Gio._promisify(
   Gio.Subprocess.prototype,
   'wait_async',
   'wait_finish'
+);
+Gio._promisify(Secret, 'password_store', 'password_store_finish');
+Gio._promisify(Secret, 'password_lookup', 'password_lookup_finish');
+Gio._promisify(Secret, 'password_clear', 'password_clear_finish');
+Gio._promisify(
+  Gio.SocketClient.prototype,
+  'connect_to_host_async',
+  'connect_to_host_finish'
 );
 Gio._promisify(
   Gio.File.prototype,
