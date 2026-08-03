@@ -13,6 +13,7 @@ import { deriveAuthCookie } from './local-auth.js';
 import { DEFAULT_EMBEDDED_PORT, ServerStore } from './server-store.js';
 import { InteractionCards } from './interaction.js';
 import { Sidebar } from './sidebar.js';
+import { BACKENDS } from './style.js';
 import { clearPassword, lookupPassword, storePassword } from './keyring.js';
 import { showSettingsDialog } from './settings.js';
 import { ellipsize } from './text.js';
@@ -24,6 +25,10 @@ Gio._promisify(Gtk.FileDialog.prototype, 'open', 'open_finish');
 // size. Both are logical pixels, scaled down only (never up).
 // One page of transcript history, matching the web client's window size.
 const TRANSCRIPT_PAGE = 100;
+
+// A session whose worker is attached and can be paused.
+const isBusy = session => session.status === 'live' || session.status === 'running' ||
+  session.status === 'awaiting_permission';
 
 
 const TranscriptItem = GObject.registerClass(
@@ -83,6 +88,8 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._modelCatalog = null;
     this._agentProfiles = [];
     this._drafts = new Map();
+    this._unread = new Set();
+    this._previousStatus = new Map();
     this._rawMarkdown = false;
     this._optimisticTurn = null;
 
@@ -90,6 +97,10 @@ class UsherWindow extends Adw.ApplicationWindow {
       selectedId: () => this._selectedId,
       searchQuery: () => this._search?.get_text().trim().toLowerCase() || '',
       onSelect: id => this._selectSession(id),
+      interactionCount: id =>
+        this._pendingInteractions.filter(p => p.session_id === id).length,
+      isUnread: id => this._unread.has(id),
+      onContextMenu: (session, row, x, y) => this._showRowMenu(session, row, x, y),
     });
     this._interactions = new InteractionCards({
       respond: (id, payload, buttons) => this._respondInteraction(id, payload, buttons),
@@ -128,18 +139,48 @@ class UsherWindow extends Adw.ApplicationWindow {
     add('settings', (_action, parameter) => this._showSettings(parameter?.get_string()[0]));
     add('servers', () => this._showConnectionDialog());
 
-    // Reading the message as the model wrote it, markup and all.
-    const raw = new Gio.SimpleAction({
-      name: 'raw-markdown',
-      state: GLib.Variant.new_boolean(false),
+    // Per-session actions. Both menus that offer them — the sidebar's context
+    // menu and the header's — name the session by setting _menuSession before
+    // they open, so the actions themselves stay parameterless.
+    const onSession = (name, callback) => add(name, () => {
+      if (this._menuSession) callback(this._menuSession);
     });
-    raw.connect('activate', () => {
-      const next = !raw.get_state().get_boolean();
-      raw.set_state(GLib.Variant.new_boolean(next));
-      this._rawMarkdown = next;
+    onSession('session-subagents', session => {
+      this._sidebar.toggleSubagents(session.id);
+      this.refresh().catch(() => {});
+    });
+    onSession('session-rename', session => this._showRenameDialog(session));
+    onSession('session-pin', session => this._runSessionAction(
+      () => this._api.setPinned(session.id, !session.pinned),
+      session.pinned ? 'Session unpinned' : 'Session pinned'
+    ));
+    onSession('session-archive', session => this._runSessionAction(
+      () => this._api.setArchived(session.id, !session.archived),
+      session.archived ? 'Session restored' : 'Session archived'
+    ));
+    onSession('session-worker', session => (isBusy(session)
+      ? this._runSessionAction(
+        () => this._api.pauseSession(session.id), 'Session worker paused')
+      // Wakes the backend without adding a turn — useful before steering a
+      // session that has gone idle.
+      : this._runSessionAction(
+        () => this._api.resumeSession(session.id), 'Session worker resumed')));
+    onSession('session-editor', session => this._openInEditor(session.cwd));
+    onSession('session-delete', session => this._showDeleteDialog(session));
+
+    // Reading the message as the model wrote it, markup and all.
+    const render = new Gio.SimpleAction({
+      name: 'render-mode',
+      parameter_type: GLib.VariantType.new('s'),
+      state: GLib.Variant.new_string('md'),
+    });
+    render.connect('activate', (action, parameter) => {
+      const mode = parameter.get_string()[0];
+      action.set_state(GLib.Variant.new_string(mode));
+      this._rawMarkdown = mode === 'raw';
       this._rerenderTranscript();
     });
-    this.add_action(raw);
+    this.add_action(render);
 
     // Radio state for the new-session config menu.
     const choice = (name, apply) => {
@@ -224,27 +265,35 @@ class UsherWindow extends Adw.ApplicationWindow {
       tooltip_text: 'Session actions',
       visible: false,
     });
-    header.pack_end(this._sessionMenu);
-    // Context usage sits beside the title it describes, hidden until the
-    // backend reports a token count.
-    this._usage = new Gtk.MenuButton({ visible: false, tooltip_text: 'Context usage' });
-    this._usage.add_css_class('flat');
-    this._usageLabel = new Gtk.Label();
-    this._usageLabel.add_css_class('caption');
-    this._usage.set_child(this._usageLabel);
-    this._usageDetail = new Gtk.Box({
-      orientation: Gtk.Orientation.VERTICAL,
-      spacing: 6,
-      margin_top: 12, margin_bottom: 12, margin_start: 12, margin_end: 12,
+    // The sidebar's context menu leaves _menuSession pointing at the row it
+    // was opened on; the header menu always acts on the selected session.
+    this._sessionMenu.connect('notify::active', button => {
+      if (button.get_active()) this._menuSession = this._selectedSession();
     });
-    this._usage.set_popover(new Gtk.Popover({ child: this._usageDetail }));
-    header.pack_end(this._usage);
+    header.pack_end(this._sessionMenu);
+    // How a message is rendered is a standing choice, so it stays visible and
+    // says which mode is on — as in the web header — rather than hiding in the
+    // primary menu.
+    const renderMode = new Gtk.Box({ valign: Gtk.Align.CENTER });
+    renderMode.add_css_class('linked');
+    renderMode.add_css_class('render-mode');
+    const renderOption = (label, value, tooltip) => {
+      const button = new Gtk.ToggleButton({ label, tooltip_text: tooltip });
+      // A stateful string action drives both buttons, which is what makes them
+      // one radio group: each is active while the state matches its target.
+      button.set_action_name('win.render-mode');
+      button.set_action_target_value(GLib.Variant.new_string(value));
+      renderMode.append(button);
+    };
+    renderOption('md', 'md', 'Render markdown');
+    renderOption('raw', 'raw', 'Show the message as the model wrote it');
+    header.pack_end(renderMode);
     contentToolbar.add_top_bar(header);
 
     const sidebarBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL });
     sidebarBox.set_size_request(300, -1);
     this._search = new Gtk.SearchEntry({ placeholder_text: 'Search sessions' });
-    this._search.connect('search-changed', () => this._filterSessions());
+    this._search.connect('search-changed', () => this._sidebar.refilter());
     const searchBar = new Gtk.SearchBar({ child: this._search });
     searchBar.set_key_capture_widget(this);
     sidebarBox.append(searchBar);
@@ -264,9 +313,6 @@ class UsherWindow extends Adw.ApplicationWindow {
     // Primary menu: app-scoped destinations, per the HIG. Session-scoped
     // actions stay in the conversation header's own menu.
     const primaryMenu = new Gio.Menu();
-    const viewSection = new Gio.Menu();
-    viewSection.append('Show _Raw Markdown', 'win.raw-markdown');
-    primaryMenu.append_section(null, viewSection);
     const appSection = new Gio.Menu();
     // Server profiles are client-local and switching one changes what
     // Settings shows, so the two stay separate entries.
@@ -338,6 +384,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       hexpand: true,
       vexpand: true,
     });
+    this._messages.add_css_class('transcript-list');
     this._messages.set_margin_top(12);
     this._messages.set_margin_bottom(12);
     this._messages.set_margin_start(12);
@@ -441,6 +488,8 @@ class UsherWindow extends Adw.ApplicationWindow {
       label: 'Approve: ask',
       tooltip_text: 'Ask before tool calls; enable to approve automatically',
     });
+    this._autoApprove.add_css_class('flat');
+    this._autoApprove.add_css_class('approve-toggle');
     this._autoApprove.connect('toggled', () => this._toggleAutoApprove());
     composerBar.append(this._autoApprove);
     // Agent / backend / model for a session that does not exist yet.
@@ -451,7 +500,58 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._newConfig.add_css_class('flat');
     composerBar.append(this._newConfig);
     const sendBox = new Gtk.Box({ spacing: 6, halign: Gtk.Align.END, hexpand: true });
-    this._send = new Gtk.Button({ icon_name: 'send-to-symbolic', tooltip_text: 'Send message' });
+    // Context usage belongs beside send: it says how full the window the next
+    // message goes into is, which is a fact about composing, not about the
+    // conversation's identity.
+    this._usage = new Gtk.MenuButton({
+      visible: false,
+      tooltip_text: 'Context usage',
+      valign: Gtk.Align.CENTER,
+    });
+    this._usage.add_css_class('flat');
+    this._usage.add_css_class('circular');
+    // A ring rather than a percentage, as in the web composer: the number is
+    // in the popover, and the arc is what gets read at a glance.
+    this._usageFraction = 0;
+    // content-width is a minimum, so without the alignment the area stretches
+    // to fill the button and the ring is drawn at the button's size.
+    this._usageRing = new Gtk.DrawingArea({
+      content_width: 22,
+      content_height: 22,
+      halign: Gtk.Align.CENTER,
+      valign: Gtk.Align.CENTER,
+    });
+    this._usageRing.set_draw_func((area, cr, width, height) => {
+      const stroke = 3;
+      const radius = (Math.min(width, height) - stroke) / 2;
+      const track = area.get_color();
+      const accent = Adw.StyleManager.get_default().get_accent_color_rgba();
+      cr.setLineWidth(stroke);
+      cr.setSourceRGBA(track.red, track.green, track.blue, track.alpha * 0.25);
+      cr.arc(width / 2, height / 2, radius, 0, 2 * Math.PI);
+      cr.stroke();
+      if (this._usageFraction > 0) {
+        const start = -Math.PI / 2;
+        cr.setSourceRGBA(accent.red, accent.green, accent.blue, accent.alpha);
+        cr.arc(width / 2, height / 2, radius, start,
+          start + 2 * Math.PI * this._usageFraction);
+        cr.stroke();
+      }
+      // GJS hands out a Cairo context that has to be released by hand.
+      cr.$dispose();
+    });
+    this._usage.set_child(this._usageRing);
+    this._usageDetail = new Gtk.Box({
+      orientation: Gtk.Orientation.VERTICAL,
+      spacing: 6,
+      margin_top: 12, margin_bottom: 12, margin_start: 12, margin_end: 12,
+    });
+    this._usage.set_popover(new Gtk.Popover({ child: this._usageDetail }));
+    sendBox.append(this._usage);
+    this._send = new Gtk.Button({
+      icon_name: 'io.github.nexustar.Usher-send-symbolic',
+      tooltip_text: 'Send message',
+    });
     this._send.add_css_class('suggested-action');
     this._send.add_css_class('circular');
     this._send.connect('clicked', () => this._sendMessage());
@@ -476,6 +576,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       return this._handleCommandKey(keyval);
     });
     this._prompt.add_controller(promptKeys);
+    this._watchDraft();
     // The composer lives in the ToolbarView's bottom bar so it gets native
     // toolbar styling (background + separator) instead of floating in the
     // content area. Visibility is toggled on the clamp.
@@ -594,7 +695,24 @@ class UsherWindow extends Adw.ApplicationWindow {
     }
   }
 
+  // A session that finished answering while it was not on screen stays unread
+  // until it is opened. The first poll has no previous status, so a fresh
+  // start marks nothing.
+  _reconcileUnread(sessions) {
+    for (const session of sessions) {
+      const previous = this._previousStatus.get(session.id);
+      if (session.id === this._selectedId || session.status === 'running' ||
+          session.archived) {
+        this._unread.delete(session.id);
+      } else if (previous === 'running') {
+        this._unread.add(session.id);
+      }
+      this._previousStatus.set(session.id, session.status);
+    }
+  }
+
   _renderSessions(sessions) {
+    this._reconcileUnread(sessions);
     this._sidebar.render(sessions);
     const selected = this._selectedId ? this._sidebar.rows.get(this._selectedId) : null;
     if (selected) {
@@ -613,93 +731,74 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._syncSessionMenu();
   }
 
+  // Per-session actions on secondary click, the way a list of items is
+  // expected to behave. The same menu is on the conversation header, which is
+  // how these actions stay reachable from the keyboard.
+  _showRowMenu(session, row, x, y) {
+    this._menuSession = session;
+    const popover = new Gtk.PopoverMenu({
+      menu_model: this._sessionMenuModel(session, { inSidebar: true }),
+      has_arrow: false,
+      halign: Gtk.Align.START,
+    });
+    popover.set_parent(row);
+    popover.set_pointing_to(new Gdk.Rectangle({ x, y, width: 1, height: 1 }));
+    // libadwaita keeps a row highlighted while it owns an open popup, which is
+    // the only cue on touch that the menu belongs to this row.
+    row.add_css_class('has-open-popup');
+    popover.connect('closed', () => {
+      row.remove_css_class('has-open-popup');
+      popover.unparent();
+    });
+    popover.popup();
+  }
+
+  _selectedSession() {
+    if (!this._selectedId) return null;
+    return this._sidebar.sessionsById?.get(this._selectedId) || this._currentSession;
+  }
+
   // The header's session-actions menu always reflects the selected session's
   // current flags; rebuilt after every list render (fresh pin/archive state)
   // and on selection changes.
   _syncSessionMenu() {
-    const session = this._selectedId
-      ? (this._sidebar.sessionsById?.get(this._selectedId) || this._currentSession)
-      : null;
+    const session = this._selectedSession();
     if (!session || session.is_subagent) {
       this._sessionMenu.set_visible(false);
-      this._sessionMenu.set_popover(null);
+      this._sessionMenu.set_menu_model(null);
       return;
     }
     this._sessionMenu.set_visible(true);
-    this._sessionMenu.set_popover(this._sessionActionsPopover(session));
+    this._sessionMenu.set_menu_model(this._sessionMenuModel(session));
   }
 
-  // The row that ends a directory group. Archived sessions arrive in pages,
-  // so this is a small button bar rather than one activatable row: collapsed
-  // it offers the count, expanded it offers "Collapse" and — while any are
-  // still held back — "Show N more".
-
-  _sessionActionsPopover(session) {
-    const popover = new Gtk.Popover();
-    const box = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 2 });
-    box.set_margin_top(6);
-    box.set_margin_bottom(6);
-    box.set_margin_start(6);
-    box.set_margin_end(6);
-    const add = (icon, label, callback, danger = false) => {
-      const button = new Gtk.Button({ halign: Gtk.Align.FILL });
-      const content = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 8 });
-      content.append(new Gtk.Image({ icon_name: icon }));
-      content.append(new Gtk.Label({ label, xalign: 0, hexpand: true }));
-      button.set_child(content);
-      button.add_css_class('flat');
-      if (danger) button.add_css_class('destructive-action');
-      button.connect('clicked', () => {
-        popover.popdown();
-        callback();
-      });
-      box.append(button);
-    };
-    add('document-edit-symbolic', 'Rename', () => this._showRenameDialog(session));
-    add(
-      session.pinned ? 'starred-symbolic' : 'non-starred-symbolic',
-      session.pinned ? 'Unpin' : 'Pin',
-      () => this._runSessionAction(
-        () => this._api.setPinned(session.id, !session.pinned),
-        session.pinned ? 'Session unpinned' : 'Session pinned'
-      )
-    );
-    add(
-      session.archived ? 'folder-open-symbolic' : 'folder-symbolic',
-      session.archived ? 'Restore from archive' : 'Archive',
-      () => this._runSessionAction(
-        () => this._api.setArchived(session.id, !session.archived),
-        session.archived ? 'Session restored' : 'Session archived'
-      )
-    );
-    if (session.status === 'live' || session.status === 'running' ||
-        session.status === 'awaiting_permission') {
-      add(
-        'media-playback-pause-symbolic',
-        'Pause worker',
-        () => this._runSessionAction(
-          () => this._api.pauseSession(session.id),
-          'Session worker paused'
-        )
+  // Sections separate the reversible actions from the destructive one, and
+  // deleting keeps its confirmation dialog. Menu items carry no icons: GNOME
+  // menus are text, and the mnemonics are what makes them keyboard-driven.
+  _sessionMenuModel(session, { inSidebar = false } = {}) {
+    const menu = new Gio.Menu();
+    const subagents = inSidebar ? this._sidebar.subagentCount(session.id) : 0;
+    if (subagents) {
+      // Subagents are hidden by default; this is the only way to reveal them.
+      const shown = this._sidebar.expandedSubagents.has(session.id);
+      const section = new Gio.Menu();
+      section.append(
+        `${shown ? '_Hide' : '_Show'} ${subagents} Subagent${subagents > 1 ? 's' : ''}`,
+        'win.session-subagents'
       );
-    } else {
-      // Wakes the backend without adding a turn — useful before steering a
-      // session that has gone idle.
-      add(
-        'media-playback-start-symbolic',
-        'Resume worker',
-        () => this._runSessionAction(
-          () => this._api.resumeSession(session.id),
-          'Session worker resumed'
-        )
-      );
+      menu.append_section(null, section);
     }
-    if (this._editorURL && session.cwd) {
-      add('text-editor-symbolic', 'Open in editor', () => this._openInEditor(session.cwd));
-    }
-    add('user-trash-symbolic', 'Delete permanently…', () => this._showDeleteDialog(session), true);
-    popover.set_child(box);
-    return popover;
+    const main = new Gio.Menu();
+    main.append('_Rename…', 'win.session-rename');
+    main.append(session.pinned ? 'Un_pin' : '_Pin', 'win.session-pin');
+    main.append(session.archived ? 'Restore from _Archive' : '_Archive', 'win.session-archive');
+    main.append(isBusy(session) ? 'Pause _Worker' : 'Resume _Worker', 'win.session-worker');
+    if (this._editorURL && session.cwd) main.append('Open in _Editor', 'win.session-editor');
+    menu.append_section(null, main);
+    const destructive = new Gio.Menu();
+    destructive.append('_Delete Permanently…', 'win.session-delete');
+    menu.append_section(null, destructive);
+    return menu;
   }
 
   // The server supplies a URL template with {cwd} substituted verbatim.
@@ -773,11 +872,10 @@ class UsherWindow extends Adw.ApplicationWindow {
   }
 
   _clearSessionSelection() {
-    this._stashDraft();
     this._leaveNewSession();
-    this._prompt.get_buffer().set_text('', -1);
     this._selectionEpoch++;
     this._selectedId = null;
+    this._prompt.get_buffer().set_text('', -1);
     this._interactionKey = null;
     this._updateInteractions(this._pendingInteractions);
     this._syncSessionMenu();
@@ -853,10 +951,12 @@ class UsherWindow extends Adw.ApplicationWindow {
 
   _leaveNewSession() {
     if (!this._newMode) return;
+    // Blank it first: once _newMode is off the composer's contents count as a
+    // draft, and this text was never one.
+    this._prompt.get_buffer().set_text('', -1);
     this._newMode = false;
     this._newBar.set_visible(false);
     this._newConfig.set_visible(false);
-    this._prompt.get_buffer().set_text('', -1);
     this._newCwd.set_text('');
   }
 
@@ -934,6 +1034,10 @@ class UsherWindow extends Adw.ApplicationWindow {
     const summary = this._newAgent ||
       [backend, modelLabel].filter(Boolean).join(' · ') || 'Default';
     this._newConfig.set_label(ellipsize(summary, 28));
+    // The picker wears the backend's colour, as the web one does; that is what
+    // carries the choice once the label is elided down to the model.
+    for (const name of BACKENDS) this._newConfig.remove_css_class(`backend-${name}`);
+    if (BACKENDS.includes(backend)) this._newConfig.add_css_class(`backend-${backend}`);
     this._title.set_subtitle(this._newAgent ? `agent: ${this._newAgent}` : '');
   }
 
@@ -975,9 +1079,11 @@ class UsherWindow extends Adw.ApplicationWindow {
       const result = await this._api.createSession(request);
       this._leaveNewSession();
       await this.refresh();
+      // Selecting the row only moves the highlight; opening the session is a
+      // separate step now that the list no longer drives it.
+      await this._selectSession(result.id);
       const row = this._sidebar.rows.get(result.id);
       if (row) this._sidebar.select(row);
-      else await this._selectSession(result.id);
     } catch (error) {
       this._showToast(error.message || String(error));
     } finally {
@@ -988,12 +1094,18 @@ class UsherWindow extends Adw.ApplicationWindow {
 
   // Unsent text belongs to the session it was typed for. Without this the
   // composer carries it to whatever is opened next — and sends it there.
-  _stashDraft() {
-    if (this._newMode || !this._selectedId) return;
-    const buffer = this._prompt.get_buffer();
-    const text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), false);
-    if (text) this._drafts.set(this._selectedId, text);
-    else this._drafts.delete(this._selectedId);
+  // A draft belongs to the session that was on screen while it was typed, so
+  // it is recorded as it is typed. Filing it at switch time instead would put
+  // it under the wrong session whenever a selection arrives from the list
+  // rather than from the user — GtkListBox emits one whenever filtering or a
+  // rebuild disturbs which row is current.
+  _watchDraft() {
+    this._prompt.get_buffer().connect('changed', buffer => {
+      if (this._newMode || !this._selectedId) return;
+      const text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), false);
+      if (text) this._drafts.set(this._selectedId, text);
+      else this._drafts.delete(this._selectedId);
+    });
   }
 
   _restoreDraft(id) {
@@ -1001,11 +1113,14 @@ class UsherWindow extends Adw.ApplicationWindow {
   }
 
   async _selectSession(id) {
-    this._stashDraft();
     this._leaveNewSession();
-    this._restoreDraft(id);
     const epoch = ++this._selectionEpoch;
     this._selectedId = id;
+    this._restoreDraft(id);
+    // Opening a session is what clears its "new response" mark.
+    if (this._unread.delete(id) && this._sidebar.sessionsById.size) {
+      this._renderSessions([...this._sidebar.sessionsById.values()]);
+    }
     this._eventStream?.stop();
     this._eventStream = null;
     this._liveTurn = null;
@@ -1222,7 +1337,8 @@ class UsherWindow extends Adw.ApplicationWindow {
     const window = Number(runtime?.context_window) || 0;
     const percent = window > 0 ? Math.min(100, Math.round(context / window * 100)) : 0;
     this._usage.set_visible(true);
-    this._usageLabel.set_label(window > 0 ? `${percent}%` : '—');
+    this._usageFraction = window > 0 ? percent / 100 : 0;
+    this._usageRing.queue_draw();
     this._usage.set_tooltip_text(window > 0
       ? `Context ${percent}% used` : 'Context limit unavailable');
 
@@ -1406,9 +1522,11 @@ class UsherWindow extends Adw.ApplicationWindow {
     try {
       const result = await this._api.fork(this._selectedId, uuid);
       await this.refresh();
+      // Selecting the row only moves the highlight; opening the session is a
+      // separate step now that the list no longer drives it.
+      await this._selectSession(result.id);
       const row = this._sidebar.rows.get(result.id);
       if (row) this._sidebar.select(row);
-      else await this._selectSession(result.id);
       this._showToast('Forked to a new session');
     } catch (error) {
       this._showToast(error.message || String(error));

@@ -33,8 +33,8 @@ if (!markdownWidget.get_first_child()) throw new Error('markdown renderer produc
 const sessions = await window._api.listSessions();
 if (sessions.length < 2) throw new Error('switch smoke test needs two sessions');
 window._renderSessions(sessions);
-const actions = window._sessionActionsPopover(sessions[0]);
-if (!actions.get_child()) {
+const actions = window._sessionMenuModel(sessions[0]);
+if (actions.get_n_items() < 2) {
   throw new Error('session action menu was not constructed');
 }
 const toolWidget = window._transcript.toolWidget({

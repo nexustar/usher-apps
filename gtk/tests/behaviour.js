@@ -35,6 +35,25 @@ const promptText = win => {
   const b = win._prompt.get_buffer();
   return b.get_text(b.get_start_iter(), b.get_end_iter(), false);
 };
+const menuLabels = (model, out = []) => {
+  for (let i = 0; i < model.get_n_items(); i++) {
+    const section = model.get_item_link(i, Gio.MENU_LINK_SECTION);
+    if (section) {
+      menuLabels(section, out);
+      continue;
+    }
+    const label = model.get_item_attribute_value(i, 'label', null);
+    if (label) out.push(label.get_string()[0]);
+  }
+  return out;
+};
+const sidebarRows = win => {
+  const out = [];
+  for (let r = win._sidebar.sessionList.get_first_child(); r; r = r.get_next_sibling()) {
+    out.push(r);
+  }
+  return out;
+};
 
 let win = null;
 let api = null;
@@ -65,6 +84,65 @@ describe('the app against a live usher', () => {
 
   it('lists the server\'s sessions in the sidebar', () => {
     expect(win._sidebar.rows.size).toBeWithin(sessions.length, Infinity);
+  });
+
+  it('reserves the status slot on every session row', () => {
+    // Idle sessions show no dot, so the slot's job is to hold the column open
+    // and keep the titles lined up.
+    const widths = new Set();
+    for (const row of win._sidebar.rows.values()) {
+      if (row.subagentOf) continue; // read-only children carry no marks
+      widths.add(row.get_child().get_first_child().get_size_request()[0]);
+    }
+    expect(widths.size).toBe(1);
+  });
+
+  it('hides the rows the search text does not match', async () => {
+    const row = win._sidebar.rows.get(sessions[0].id);
+    win._search.set_text('zzzz-nothing-matches-this');
+    await until('the list to filter', () => !row.get_child_visible());
+    win._search.set_text('');
+    await until('the list to come back', () => row.get_child_visible());
+  });
+
+  it('opens a menu on the row and marks it while the menu is up', async () => {
+    const row = win._sidebar.rows.get(sessions[0].id);
+    win._showRowMenu(sessions[0], row, 4, 4);
+    expect(row.has_css_class('has-open-popup')).toBeTruthy();
+    const popover = descend(row).find(w => w instanceof Gtk.PopoverMenu);
+    expect(popover).toBeTruthy();
+    popover.popdown();
+    await until('the row to be released', () => !row.has_css_class('has-open-popup'));
+  });
+
+  it('names the session actions in the menu model', () => {
+    const labels = menuLabels(win._sessionMenuModel(sessions[0]));
+    expect(labels).toContain('_Rename…');
+    expect(labels).toContain('_Delete Permanently…');
+    expect(labels.includes('_Pin') || labels.includes('Un_pin')).toBeTruthy();
+  });
+
+  it('folds a directory group\'s archived sessions behind one row', () => {
+    const rows = sidebarRows(win);
+    const toggle = rows.find(r => r.archivedToggle);
+    if (!toggle) return; // nothing archived on this server
+    const archived = rows.find(r => r.archived && r.groupKey === toggle.groupKey);
+    expect(win._sidebar.rowMatches(archived)).toBeFalsy();
+    toggle.onActivate();
+    expect(win._sidebar.rowMatches(archived)).toBeTruthy();
+    toggle.onActivate();
+    expect(win._sidebar.rowMatches(archived)).toBeFalsy();
+  });
+
+  it('opens a session on activation, not on selection', async () => {
+    const target = sessions[1];
+    await win._selectSession(sessions[0].id);
+    // GtkListBox moves the selection by itself when the list is filtered or
+    // rebuilt; only a click or Enter may open a session.
+    win._sidebar.select(win._sidebar.rows.get(target.id));
+    expect(win._selectedId).toBe(sessions[0].id);
+    win._sidebar.sessionList.emit('row-activated', win._sidebar.rows.get(target.id));
+    await until('the session to open', () => win._selectedId === target.id);
   });
 
   it('keeps a draft with the session it was typed for', async () => {
@@ -164,10 +242,42 @@ describe('the app against a live usher', () => {
     win._prompt.get_buffer().set_text('', -1);
   });
 
+  it('keeps the render-mode buttons in one radio group', () => {
+    const options = descend(win).filter(w => w instanceof Gtk.ToggleButton &&
+      w.get_action_name() === 'win.render-mode');
+    expect(options).toHaveLength(2);
+    expect(options[0].get_active()).toBeTruthy();
+    expect(options[1].get_active()).toBeFalsy();
+    options[1].emit('clicked');
+    expect(options[1].get_active()).toBeTruthy();
+    expect(options[0].get_active()).toBeFalsy();
+    expect(win._rawMarkdown).toBeTruthy();
+    options[0].emit('clicked');
+    expect(win._rawMarkdown).toBeFalsy();
+  });
+
+  it('wears the chosen backend\'s colour on the config picker', () => {
+    win._modelCatalog = { backends: ['claude', 'codex'], models: {} };
+    win._newBackend = 'codex';
+    win._syncNewConfig();
+    expect(win._newConfig.has_css_class('backend-codex')).toBeTruthy();
+    expect(win._newConfig.has_css_class('backend-claude')).toBeFalsy();
+    win._newBackend = 'claude';
+    win._syncNewConfig();
+    expect(win._newConfig.has_css_class('backend-claude')).toBeTruthy();
+    expect(win._newConfig.has_css_class('backend-codex')).toBeFalsy();
+  });
+
+  it('shows context usage in the composer, beside send', () => {
+    expect(descend(win._composer).includes(win._usage)).toBeTruthy();
+    expect(win._usage.get_next_sibling()).toBe(win._send);
+  });
+
   it('shows context usage once the backend reports tokens', () => {
     win._renderRuntime({ model: 'sonnet', effort: 'high', context_tokens: 42000, context_window: 200000 });
     expect(win._usage.get_visible()).toBeTruthy();
-    expect(win._usageLabel.get_label()).toBe('21%');
+    expect(win._usageFraction).toBe(0.21);
+    expect(win._usage.get_tooltip_text()).toBe('Context 21% used');
     expect(labels(win._usageDetail)).toContain('sonnet');
     win._renderRuntime({ context_tokens: 0 });
     expect(win._usage.get_visible()).toBeFalsy();

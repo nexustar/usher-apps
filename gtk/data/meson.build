@@ -15,3 +15,10 @@ install_data(
   install_dir: get_option('datadir') / 'icons/hicolor/scalable/apps',
 )
 
+# A paper-plane "send" is the chat convention but is not an Adwaita icon, so
+# the app carries its own. Namespaced by app id, as app-provided icons are.
+install_data(
+  'icons/hicolor/symbolic/apps/io.github.nexustar.Usher-send-symbolic.svg',
+  install_dir: get_option('datadir') / 'icons/hicolor/symbolic/apps',
+)
+
