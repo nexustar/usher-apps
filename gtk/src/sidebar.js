@@ -238,10 +238,7 @@ export class Sidebar {
     // A subagent is a read-only child of the turn that spawned it: no state of
     // its own to act on, so no marks — it starts where its parent's title
     // does and the web sidebar's dash is what says it is nested.
-    if (!child) {
-      content.append(this._slot(STATUS_SLOT, this._statusDot(session)));
-      if (session.auto_approve) content.append(this._autoMark());
-    }
+    if (!child) content.append(this._slot(STATUS_SLOT, this._statusDot(session)));
     const label = new Gtk.Label({
       label: child ? `- ${title}` : title,
       xalign: 0,
@@ -322,14 +319,6 @@ export class Sidebar {
       : state === 'unread' ? 'New response'
         : state === 'running' ? 'Running' : 'Worker live');
     return dot;
-  }
-
-  // The web sidebar's mark for a session that runs tools unattended.
-  _autoMark() {
-    const auto = new Gtk.Label({ label: 'ϟ', valign: Gtk.Align.CENTER });
-    auto.add_css_class('session-auto');
-    auto.set_tooltip_text('Approves tool calls automatically');
-    return auto;
   }
 
   subagentCount(sessionId) {

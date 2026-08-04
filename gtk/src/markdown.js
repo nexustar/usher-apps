@@ -1,26 +1,12 @@
-import Adw from 'gi://Adw?version=1';
-import GtkSource from 'gi://GtkSource?version=5';
 import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk?version=4.0';
 import Pango from 'gi://Pango';
 
 import './vendor/marked.umd.js';
 
-GtkSource.init();
 
 const marked = globalThis.marked;
 if (!marked?.lexer) throw new Error('vendored marked lexer did not load');
-
-const languageAliases = new Map([
-  ['bash', 'sh'], ['shell', 'sh'], ['zsh', 'sh'],
-  ['js', 'javascript'], ['jsx', 'js'],
-  ['ts', 'typescript'], ['tsx', 'typescript-jsx'],
-  ['py', 'python'], ['rb', 'ruby'],
-  ['c++', 'cpp'], ['cc', 'cpp'], ['cs', 'c-sharp'],
-  ['yml', 'yaml'], ['md', 'markdown'],
-]);
-
-const languageManager = GtkSource.LanguageManager.get_default();
 
 function escape(text) {
   return GLib.markup_escape_text(String(text ?? ''), -1);
@@ -78,36 +64,25 @@ function labelFor(token, extra = {}) {
   return label;
 }
 
+// Code is monospace text, not a highlighted editor: usher does not do syntax
+// highlighting (it is on the project's out-of-scope list, and the web UI
+// renders a plain <pre>). Diff fences are the one exception the web makes —
+// it colours +/-/@@ lines, so this does too.
 function codeBlock(token) {
-  const languageName = String(token.lang || '').trim().split(/\s+/)[0].toLowerCase();
-  const languageId = languageAliases.get(languageName) || languageName;
-  const language = languageId ? languageManager.get_language(languageId) : null;
-  const buffer = new GtkSource.Buffer({ highlight_syntax: Boolean(language) });
-  if (language) buffer.set_language(language);
-  const schemes = GtkSource.StyleSchemeManager.get_default();
-  const dark = Adw.StyleManager.get_default().get_dark();
-  const scheme = schemes.get_scheme(dark ? 'Adwaita-dark' : 'Adwaita') ||
-    schemes.get_scheme(dark ? 'classic-dark' : 'classic');
-  if (scheme) buffer.set_style_scheme(scheme);
-  buffer.set_text(String(token.text || '').trim(), -1);
-  const view = new GtkSource.View({
-    buffer,
-    editable: false,
-    cursor_visible: false,
-    monospace: true,
-    show_line_numbers: false,
-    highlight_current_line: false,
-    wrap_mode: Gtk.WrapMode.NONE,
+  const text = String(token.text || '').trim();
+  const isDiff = /^diff\b/.test(String(token.lang || '').trim());
+  const label = new Gtk.Label({
+    xalign: 0,
+    yalign: 0,
+    selectable: true,
+    wrap: false,
     hexpand: true,
-    top_margin: 8,
-    bottom_margin: 8,
-    left_margin: 8,
-    right_margin: 8,
-    pixels_above_lines: 1,
-    pixels_below_lines: 1,
   });
+  label.add_css_class('markdown-code-text');
+  if (isDiff) label.set_markup(diffMarkup(text));
+  else label.set_text(text);
   const scroll = new Gtk.ScrolledWindow({
-    child: view,
+    child: label,
     hscrollbar_policy: Gtk.PolicyType.AUTOMATIC,
     vscrollbar_policy: Gtk.PolicyType.NEVER,
     propagate_natural_height: true,
@@ -117,6 +92,16 @@ function codeBlock(token) {
   const frame = new Gtk.Frame({ child: scroll, hexpand: true });
   frame.add_css_class('markdown-code');
   return frame;
+}
+
+function diffMarkup(text) {
+  return text.split('\n').map(line => {
+    const escaped = escape(line);
+    if (line.startsWith('+')) return `<span foreground="#3fb950">${escaped}</span>`;
+    if (line.startsWith('-')) return `<span foreground="#f85149">${escaped}</span>`;
+    if (line.startsWith('@@')) return `<span foreground="#8b949e">${escaped}</span>`;
+    return escaped;
+  }).join('\n');
 }
 
 function listBlock(token, options) {

@@ -27,11 +27,39 @@ const CSS = `
   border-radius: 8px;
 }
 
+/* Tool calls recede into the background: an outline and nothing else, which
+   is what the web settled on — they are scaffolding, not content. */
 .tool-card {
-  background-color: alpha(currentColor, 0.04);
-  border-radius: 4px;
+  border-radius: 12px;
   margin-top: 4px;
   margin-bottom: 4px;
+}
+
+/* Consecutive tool calls merge into one block: the run shares an outline, and
+   only its ends are rounded. The web overlaps the two hairlines with -1px,
+   which works there because its border colour is opaque; a GtkFrame's border
+   is translucent, so overlapping would double the alpha into a dark seam.
+   Drop the upper border instead and let the one above it serve as the join. */
+.tool-group > .tool-card {
+  margin-top: 0;
+  margin-bottom: 0;
+  border-radius: 0;
+}
+
+.tool-group > .tool-card:not(:first-child) {
+  border-top-style: none;
+}
+
+.tool-group > .tool-card:first-child {
+  margin-top: 4px;
+  border-top-left-radius: 12px;
+  border-top-right-radius: 12px;
+}
+
+.tool-group > .tool-card:last-child {
+  margin-bottom: 4px;
+  border-bottom-left-radius: 12px;
+  border-bottom-right-radius: 12px;
 }
 
 /* GTK 4 names the GtkExpander CSS node expander-widget. */
@@ -50,14 +78,19 @@ const CSS = `
   opacity: 0.88;
 }
 
-/* Code blocks take their colors from a GtkSourceView scheme matched to the
-   app theme (see markdown.js); the frame adds a hairline so the block reads
-   as one inset unit. */
+/* Code blocks are plain monospace — usher does no syntax highlighting — on the
+   dark slab the web uses in both colour schemes. */
 .markdown-code {
-  border: 1px solid alpha(currentColor, 0.15);
+  border-style: none;
   border-radius: 5px;
   margin-top: 4px;
   margin-bottom: 4px;
+}
+
+.markdown-code-text {
+  font-family: monospace;
+  font-size: 0.9em;
+  padding: 8px;
 }
 
 .markdown-table {
@@ -153,11 +186,6 @@ const CSS = `
   to { opacity: 1; }
 }
 
-.session-auto {
-  font-size: 0.8em;
-  color: @warning_color;
-}
-
 /* How many decisions a session is holding, as the pill every GTK chat sidebar
    uses for an unread count. */
 .session-count {
@@ -206,21 +234,28 @@ const CSS = `
 }
 `;
 
-/* Backend brand colours, the one thing here with no theme token behind it, so
-   they carry their own light and dark values — the same pairs the web uses.
-   GTK's CSS parser has no @media, so the two sets are swapped at runtime. */
+/* The colours with no theme token behind them: backend brands, and the code
+   slab the web keeps dark in both schemes. Each carries a light and a dark
+   value, and GTK's CSS parser has no @media, so the pair is swapped at
+   runtime. Values are the web's. */
 const BACKEND_COLORS = {
   claude: ['#bd5b3d', '#e0916f'],
   codex: ['#6f76d6', '#8e93e0'],
   pi: ['#09090b', '#ffffff'],
 };
 
+const CODE_BLOCK_BG = ['#1f2328', '#0a0d12'];
+const CODE_BLOCK_FG = ['#e6edf3', '#e6edf3'];
+
 export const BACKENDS = Object.keys(BACKEND_COLORS);
 
-function backendCss(dark) {
-  return BACKENDS
-    .map(name => `.backend-${name} { color: ${BACKEND_COLORS[name][dark ? 1 : 0]}; }`)
-    .join('\n');
+function schemedCss(dark) {
+  const i = dark ? 1 : 0;
+  return [
+    ...BACKENDS.map(name => `.backend-${name} { color: ${BACKEND_COLORS[name][i]}; }`),
+    `.markdown-code { background-color: ${CODE_BLOCK_BG[i]}; }`,
+    `.markdown-code-text { color: ${CODE_BLOCK_FG[i]}; }`,
+  ].join('\n');
 }
 
 let installed = false;
@@ -237,14 +272,14 @@ export function installStyles() {
     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
   );
 
-  const backends = new Gtk.CssProvider();
+  const schemed = new Gtk.CssProvider();
   const manager = Adw.StyleManager.get_default();
-  const applyBackendColors = () => backends.load_from_string(backendCss(manager.get_dark()));
-  applyBackendColors();
-  manager.connect('notify::dark', applyBackendColors);
+  const applySchemed = () => schemed.load_from_string(schemedCss(manager.get_dark()));
+  applySchemed();
+  manager.connect('notify::dark', applySchemed);
   Gtk.StyleContext.add_provider_for_display(
     display,
-    backends,
+    schemed,
     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
   );
   installed = true;

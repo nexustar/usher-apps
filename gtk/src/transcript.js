@@ -49,16 +49,16 @@ export class TranscriptView {
     this._ctx = ctx;
   }
 
-  turnHeader(name, ts, alignEnd) {
-    const header = new Gtk.Box({
+  // The turn's footer: timestamp on the left, fork on the right. There is no
+  // speaker name — the bubble marks the user and flat content marks the
+  // assistant, which is the split the web UI settled on.
+  turnFooter(ts, alignEnd) {
+    const footer = new Gtk.Box({
       orientation: Gtk.Orientation.HORIZONTAL,
-      spacing: 6,
+      spacing: 18,
       halign: alignEnd ? Gtk.Align.END : Gtk.Align.START,
+      margin_top: 2,
     });
-    const who = new Gtk.Label({ label: name });
-    who.add_css_class('caption-heading');
-    who.add_css_class('dim-label');
-    header.append(who);
     const time = new Date(ts || '');
     if (!Number.isNaN(time.getTime())) {
       const stamp = new Gtk.Label({
@@ -66,14 +66,9 @@ export class TranscriptView {
       });
       stamp.add_css_class('caption');
       stamp.add_css_class('dim-label');
-      header.append(stamp);
+      footer.append(stamp);
     }
-    return header;
-  }
-
-  agentName() {
-    const backend = this._ctx.backendName();
-    return backend ? backend.charAt(0).toUpperCase() + backend.slice(1) : 'Assistant';
+    return footer;
   }
 
   // A fork is a prefix copy of the transcript up to this turn — edit-copy is
@@ -106,17 +101,38 @@ export class TranscriptView {
     outer.set_margin_end(12);
 
     if (turn.role === 'assistant') {
-      const header = this.turnHeader(this.agentName(), turn.ts, false);
-      if (turn.uuid && !turn.live) header.append(this.forkButton(turn.uuid));
-      outer.append(header);
       const flow = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6 });
-      for (const part of turn.parts || []) {
-        if (part.type === 'tool') {
-          flow.append(this.toolWidget(part));
+      // A run of tool calls reads as one block rather than a stack of separate
+      // cards, which is what the web does with them. An image part renders as
+      // a picture, not a card, so it ends the run.
+      const run = [];
+      const flush = () => {
+        if (!run.length) return;
+        if (run.length === 1) {
+          flow.append(run[0]);
         } else {
-          flow.append(this.renderText(part.content || ''));
+          const group = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 0 });
+          group.add_css_class('tool-group');
+          for (const card of run) group.append(card);
+          flow.append(group);
         }
+        run.length = 0;
+      };
+      for (const part of turn.parts || []) {
+        if (part.type !== 'tool') {
+          flush();
+          flow.append(this.renderText(part.content || ''));
+          continue;
+        }
+        const widget = this.toolWidget(part);
+        if (widget.has_css_class('tool-card')) {
+          run.push(widget);
+          continue;
+        }
+        flush();
+        flow.append(widget);
       }
+      flush();
       if (turn.live && turn.previewText) {
         const preview = markdown.render(turn.previewText);
         preview.add_css_class('dim-label');
@@ -128,6 +144,13 @@ export class TranscriptView {
         flow.append(status);
       }
       outer.append(flow);
+      // Footers only settle once the turn has: a live turn has neither a final
+      // timestamp nor a fork point yet.
+      if (!turn.live) {
+        const footer = this.turnFooter(turn.ts, false);
+        if (turn.uuid) footer.append(this.forkButton(turn.uuid));
+        if (footer.get_first_child()) outer.append(footer);
+      }
     } else if (turn.role !== 'user' && turn.role !== 'assistant') {
       // Context-compaction markers and similar system notices: a centered,
       // dim, compact marker instead of a speech bubble.
@@ -139,8 +162,6 @@ export class TranscriptView {
       marker.add_css_class('dim-label');
       outer.append(marker);
     } else {
-      const name = turn.role === 'user' ? 'You' : (turn.role || 'You');
-      outer.append(this.turnHeader(name, turn.ts, true));
       const inner = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6 });
       inner.set_margin_top(8);
       inner.set_margin_bottom(8);
@@ -154,6 +175,8 @@ export class TranscriptView {
       // reads as right-aligned speech.
       bubble.set_margin_start(48);
       outer.append(bubble);
+      const footer = this.turnFooter(turn.ts, true);
+      if (footer.get_first_child()) outer.append(footer);
     }
     return new Adw.Clamp({
       child: outer,

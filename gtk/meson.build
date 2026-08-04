@@ -1,7 +1,5 @@
 project('usher-gtk', version: '0.1.0', meson_version: '>= 0.61.0')
 
-dependency('gtksourceview-5', version: '>= 5.0')
-
 app_id = 'io.github.nexustar.Usher'
 app_name = 'usher'
 
