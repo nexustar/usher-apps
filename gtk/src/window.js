@@ -37,6 +37,10 @@ class TranscriptItem extends GObject.Object {
     super._init();
     this.turn = turn;
     this.key = key;
+    // Built on first bind and kept: GtkListView rebinds a row every time it
+    // scrolls back into view, and building a turn costs a markdown parse. Any
+    // change to a turn replaces its item, so the cache cannot go stale.
+    this.widget = null;
   }
 });
 
@@ -374,7 +378,8 @@ class UsherWindow extends Adw.ApplicationWindow {
       listItem.set_activatable(false);
       listItem.set_selectable(false);
       const item = listItem.get_item();
-      listItem.set_child(this._transcript.turnWidget(item.turn));
+      if (!item.widget) item.widget = this._transcript.turnWidget(item.turn);
+      listItem.set_child(item.widget);
     });
     transcriptFactory.connect('unbind', (_factory, listItem) => listItem.set_child(null));
     this._messages = new Gtk.ListView({
@@ -734,23 +739,36 @@ class UsherWindow extends Adw.ApplicationWindow {
   // Per-session actions on secondary click, the way a list of items is
   // expected to behave. The same menu is on the conversation header, which is
   // how these actions stay reachable from the keyboard.
+  // One popover moved between rows, not one per click: showing a popover
+  // gives it its own surface and renderer, and those do not come back when it
+  // is dropped. Fractal's sidebar shares a single row menu for the same
+  // reason.
   _showRowMenu(session, row, x, y) {
     this._menuSession = session;
-    const popover = new Gtk.PopoverMenu({
-      menu_model: this._sessionMenuModel(session, { inSidebar: true }),
-      has_arrow: false,
-      halign: Gtk.Align.START,
-    });
-    popover.set_parent(row);
-    popover.set_pointing_to(new Gdk.Rectangle({ x, y, width: 1, height: 1 }));
+    if (!this._rowMenu) {
+      this._rowMenu = new Gtk.PopoverMenu({
+        has_arrow: false,
+        halign: Gtk.Align.START,
+      });
+      // Read the popover back off the signal instead of capturing it: a
+      // closure an object owns that also refers to that object cannot be
+      // collected.
+      this._rowMenu.connect('closed', menu => {
+        menu.get_parent()?.remove_css_class('has-open-popup');
+        menu.unparent();
+      });
+    }
+    if (this._rowMenu.get_parent()) {
+      this._rowMenu.get_parent().remove_css_class('has-open-popup');
+      this._rowMenu.unparent();
+    }
+    this._rowMenu.set_menu_model(this._sessionMenuModel(session, { inSidebar: true }));
+    this._rowMenu.set_parent(row);
+    this._rowMenu.set_pointing_to(new Gdk.Rectangle({ x, y, width: 1, height: 1 }));
     // libadwaita keeps a row highlighted while it owns an open popup, which is
     // the only cue on touch that the menu belongs to this row.
     row.add_css_class('has-open-popup');
-    popover.connect('closed', () => {
-      row.remove_css_class('has-open-popup');
-      popover.unparent();
-    });
-    popover.popup();
+    this._rowMenu.popup();
   }
 
   _selectedSession() {
@@ -1451,15 +1469,16 @@ class UsherWindow extends Adw.ApplicationWindow {
     }
     // Everything past the common prefix goes, which is also how the live turn
     // and the optimistic echo are reconciled away.
-    while (this._transcriptStore.get_n_items() > common)
-      this._transcriptStore.remove(common);
     this._renderedTurns.length = common;
     this._optimisticTurn = null;
     this._liveTurn = null;
-    for (let i = common; i < incoming.length; i++) {
-      this._transcriptStore.append(new TranscriptItem(incoming[i].turn, incoming[i].key));
-      this._renderedTurns.push(incoming[i]);
-    }
+    // One splice rather than a remove and an append per turn: each of those
+    // is an items-changed the list view has to answer.
+    const added = incoming.slice(common)
+      .map(entry => new TranscriptItem(entry.turn, entry.key));
+    this._transcriptStore.splice(
+      common, this._transcriptStore.get_n_items() - common, added);
+    for (let i = common; i < incoming.length; i++) this._renderedTurns.push(incoming[i]);
     this._scrollToBottom(initialLoad);
     this._transcriptTotal = total;
     this._windowStart = offset;

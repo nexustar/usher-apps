@@ -38,6 +38,7 @@ export class Sidebar {
     this.expandedArchived = new Set();
     this.archivedPages = new Map();
     this._subagentCounts = new Map();
+    this._disclosures = new Map();
     this.sessionList = new Gtk.ListBox({ selection_mode: Gtk.SelectionMode.SINGLE });
     this.sessionList.add_css_class('navigation-sidebar');
     this.sessionList.add_css_class('session-list');
@@ -164,6 +165,7 @@ export class Sidebar {
     let child;
     while ((child = this.sessionList.get_first_child())) this.sessionList.remove(child);
     this.rows.clear();
+    this._disclosures.clear();
 
     // Each directory group ends with its own archived disclosure. It is a real
     // row rather than a filtered-away header control, because a group whose
@@ -271,17 +273,21 @@ export class Sidebar {
       row.archived = true;
     }
 
+    // The row is read back off the gesture rather than captured: a closure a
+    // widget owns that also refers to that widget is a cycle across the JS and
+    // GObject heaps, and nothing can collect it. The list rebuilds on every
+    // change, so one such row per rebuild is a steady leak.
     const menu = new Gtk.GestureClick({ button: 3 });
     menu.connect('pressed', (gesture, _n, x, y) => {
       // Claim it, or the list box treats the same press as a click on the row.
       gesture.set_state(Gtk.EventSequenceState.CLAIMED);
-      this._ctx.onContextMenu(session, row, x, y);
+      this._ctx.onContextMenu(session, gesture.get_widget(), x, y);
     });
     row.add_controller(menu);
     const held = new Gtk.GestureLongPress({ touch_only: true });
     held.connect('pressed', (gesture, x, y) => {
       gesture.set_state(Gtk.EventSequenceState.CLAIMED);
-      this._ctx.onContextMenu(session, row, x, y);
+      this._ctx.onContextMenu(session, gesture.get_widget(), x, y);
     });
     row.add_controller(held);
     return row;
@@ -344,13 +350,26 @@ export class Sidebar {
   // that pages in the next batch. Rows rather than buttons inside a row: a
   // list entry whose whole job is to be pressed is a row, which is how the
   // collapsible sections in GNOME's own sidebars are built.
+  // The pair is kept on the sidebar, not closed over by the rows' handlers: a
+  // handler a row owns that refers back to that row (or to its sibling, which
+  // refers back in turn) is a cycle across the JS and GObject heaps that
+  // nothing can collect. The map is dropped on the next rebuild, so the rows
+  // go with it.
   archivedRows(groupKey, count) {
     const arrow = new Gtk.Image({
       icon_name: 'pan-up-symbolic',
       valign: Gtk.Align.CENTER,
     });
     arrow.add_css_class('session-disclosure');
-    const toggle = this._disclosureRow(groupKey, arrow, () => {
+    const toggle = this._disclosureRow(groupKey, arrow, 'toggle');
+    const more = this._disclosureRow(groupKey, null, 'more');
+    this._disclosures.set(groupKey, { toggle, more, arrow, count });
+    this._syncDisclosure(groupKey);
+    return [toggle, more];
+  }
+
+  _activateDisclosure(groupKey, which) {
+    if (which === 'toggle') {
       if (this.expandedArchived.has(groupKey)) {
         this.expandedArchived.delete(groupKey);
         this.archivedPages.delete(groupKey);
@@ -358,34 +377,33 @@ export class Sidebar {
         this.expandedArchived.add(groupKey);
         this.archivedPages.set(groupKey, ARCHIVED_PAGE_SIZE);
       }
-      sync();
-      this.refilter();
-    });
-    const more = this._disclosureRow(groupKey, null, () => {
+    } else {
       this.archivedPages.set(
         groupKey, this.archivedVisible(groupKey) + ARCHIVED_PAGE_SIZE);
-      sync();
-      this.refilter();
-    });
-    const sync = () => {
-      const expanded = this.expandedArchived.has(groupKey);
-      toggle.setLabel(`${count} archived`);
-      if (expanded) arrow.remove_css_class('collapsed');
-      else arrow.add_css_class('collapsed');
-      const held = expanded ? Math.max(0, count - this.archivedVisible(groupKey)) : 0;
-      more.setLabel(`Show ${held} more`);
-      more.set_visible(held > 0);
-    };
-    sync();
-    return [toggle, more];
+    }
+    this._syncDisclosure(groupKey);
+    this.refilter();
   }
 
-  _disclosureRow(groupKey, arrow, onActivate) {
+  _syncDisclosure(groupKey) {
+    const group = this._disclosures.get(groupKey);
+    if (!group) return;
+    const expanded = this.expandedArchived.has(groupKey);
+    group.toggle.setLabel(`${group.count} archived`);
+    if (expanded) group.arrow.remove_css_class('collapsed');
+    else group.arrow.add_css_class('collapsed');
+    const held = expanded
+      ? Math.max(0, group.count - this.archivedVisible(groupKey)) : 0;
+    group.more.setLabel(`Show ${held} more`);
+    group.more.set_visible(held > 0);
+  }
+
+  _disclosureRow(groupKey, arrow, which) {
     const row = new Gtk.ListBoxRow({ activatable: true, selectable: false });
     row.archivedToggle = true;
     row.groupKey = groupKey;
     row.groupLabel = groupKey;
-    row.onActivate = onActivate;
+    row.onActivate = () => this._activateDisclosure(groupKey, which);
     const content = new Gtk.Box({
       orientation: Gtk.Orientation.HORIZONTAL,
       spacing: SLOT_GAP,
