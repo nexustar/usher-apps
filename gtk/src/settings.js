@@ -307,14 +307,29 @@ export async function showSettingsDialog(parent, context) {
     );
     prefs.add(prompt.group);
 
-    const collect = () => ({
-      name: nameRow.get_text().trim(),
-      cwd: cwdInput.value,
-      backend: pickers.backend,
-      model: pickers.model,
-      append_system_prompt: prompt.value,
-      auto_approve: approveRow.get_active(),
-    });
+    const advanced = new Adw.PreferencesGroup({ title: 'Advanced' });
+    const extraArgs = new Adw.EntryRow({ title: 'Extra CLI flags' });
+    extraArgs.add_css_class('monospace');
+    extraArgs.set_text((agent?.extra_args || []).join(' '));
+    // usher appends these to the backend's own spawn flags.
+    extraArgs.set_tooltip_text(
+      'Space-separated flags added when spawning this agent\'s backend');
+    advanced.add(extraArgs);
+    prefs.add(advanced);
+
+    const collect = () => {
+      const flags = extraArgs.get_text().trim();
+      return {
+        name: nameRow.get_text().trim(),
+        cwd: cwdInput.value,
+        backend: pickers.backend,
+        model: pickers.model,
+        append_system_prompt: prompt.value,
+        auto_approve: approveRow.get_active(),
+        // The API wants an array, and an empty field must not send [""].
+        extra_args: flags ? flags.split(/\s+/) : undefined,
+      };
+    };
 
     if (agent) {
       const actions = new Adw.PreferencesGroup();

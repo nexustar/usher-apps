@@ -160,6 +160,29 @@ describe('the app against a live usher', () => {
     win._prompt.get_buffer().set_text('', -1);
   });
 
+  it('keeps following the bottom when a delta batch is taller than the threshold', () => {
+    // The decision has to be sampled before the content grows, or a large
+    // batch reads as the reader having scrolled up.
+    const adjustment = win._chatScroll.get_vadjustment();
+    adjustment.set_value(Math.max(0, adjustment.get_upper() - adjustment.get_page_size()));
+    let sampledWhileAtBottom = null;
+    const realNear = win._isNearBottom.bind(win);
+    win._isNearBottom = () => {
+      const near = realNear();
+      if (sampledWhileAtBottom === null) sampledWhileAtBottom = near;
+      return near;
+    };
+    try {
+      win._growTranscript(() => {
+        // Stand in for a tall batch: push the view far from the bottom.
+        adjustment.set_value(0);
+      });
+      expect(sampledWhileAtBottom).toBeTruthy();
+    } finally {
+      win._isNearBottom = realNear;
+    }
+  });
+
   it('echoes a sent message before the server confirms it', () => {
     const before = win._transcriptStore.get_n_items();
     win._appendOptimisticTurn('hello there');

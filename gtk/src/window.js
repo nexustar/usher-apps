@@ -2101,11 +2101,12 @@ class UsherWindow extends Adw.ApplicationWindow {
     if (this._optimisticTurn?.content === data.content) this._removeOptimisticTurn();
     if (this._renderedTurns.some(item => item.key === key)) return;
     const item = new TranscriptItem(turn, key);
-    const liveIndex = this._liveTurn ? this._transcriptStore.get_n_items() - 1 : -1;
-    if (liveIndex >= 0) this._transcriptStore.insert(liveIndex, item);
-    else this._transcriptStore.append(item);
-    this._renderedTurns.push({ key, turn });
-    this._scrollToBottom();
+    this._growTranscript(() => {
+      const liveIndex = this._liveTurn ? this._transcriptStore.get_n_items() - 1 : -1;
+      if (liveIndex >= 0) this._transcriptStore.insert(liveIndex, item);
+      else this._transcriptStore.append(item);
+      this._renderedTurns.push({ key, turn });
+    });
   }
 
   // A 'part' SSE event wraps the server-rendered TurnPart:
@@ -2123,8 +2124,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._liveTurn.previewText = '';
       this._liveTurn.acceptDeltas = false;
     }
-    this._refreshLiveTurn();
-    this._scrollToBottom();
+    this._growTranscript(() => this._refreshLiveTurn());
   }
 
   // 'part.delta' grows an ephemeral text preview; the complete JSONL-derived
@@ -2139,10 +2139,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     if (this._previewRefreshId) return;
     this._previewRefreshId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 150, () => {
       this._previewRefreshId = 0;
-      if (this._liveTurn) {
-        this._refreshLiveTurn();
-        this._scrollToBottom();
-      }
+      if (this._liveTurn) this._growTranscript(() => this._refreshLiveTurn());
       return GLib.SOURCE_REMOVE;
     });
   }
@@ -2155,6 +2152,16 @@ class UsherWindow extends Adw.ApplicationWindow {
       index, 1,
       [new TranscriptItem({ ...this._liveTurn, parts: [...this._liveTurn.parts] }, '__live__')]
     );
+  }
+
+  // Whether to follow has to be decided before the content grows. A batch of
+  // deltas taller than the 120px threshold would otherwise read as the reader
+  // having scrolled up, and the view would stop following for the rest of the
+  // turn — the regression usher fixed in the web client in fe5e715.
+  _growTranscript(mutate) {
+    const stick = this._isNearBottom();
+    mutate();
+    if (stick) this._scrollToBottom(true);
   }
 
   _isNearBottom() {
