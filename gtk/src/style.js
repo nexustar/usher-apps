@@ -121,19 +121,6 @@ const CSS = `
   border-radius: 8px;
 }
 
-/* A session list is long and every row is one line, so it does not need the
-   36px row and 2px gap .navigation-sidebar gives a list of destinations. */
-.session-list > row {
-  min-height: 30px;
-  margin-bottom: 0;
-}
-
-/* Subagent rows are a step down in type and carry no marks, so they hold a
-   line in less. */
-.session-list > row.subagent {
-  min-height: 24px;
-}
-
 /* Auto-approve reads by colour, not by a pressed slab: the composer's tool
    row stays flat, and the amber is the same warning colour the sidebar's ϟ
    uses for a session that runs tools unattended. */
@@ -172,12 +159,20 @@ const CSS = `
 }
 
 
+/* The section header node carries padding and a minimum height of its own,
+   which sat under every directory heading as a chasm. Zeroing both leaves the
+   heading exactly its label, so the spacing is the label's margins — and it
+   scales with the font instead of being a fixed number of pixels. */
+.session-list > header {
+  padding: 0;
+  min-height: 0;
+}
+
 /* Session state, mirroring the web sidebar: a dot in a fixed slot so titles
    line up whether or not one is shown. A live worker that is merely warm gets
    a dim green dot — present but quiet, so a list of idle sessions doesn't
    shout and full brightness is left for actual activity. */
 .session-dot {
-  font-size: 0.7em;
   color: @success_color;
   opacity: 0.5;
 }

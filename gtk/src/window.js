@@ -149,10 +149,8 @@ class UsherWindow extends Adw.ApplicationWindow {
     const onSession = (name, callback) => add(name, () => {
       if (this._menuSession) callback(this._menuSession);
     });
-    onSession('session-subagents', session => {
-      this._sidebar.toggleSubagents(session.id);
-      this.refresh().catch(() => {});
-    });
+    // toggleSubagents re-runs the filter itself; the rows already exist.
+    onSession('session-subagents', session => this._sidebar.toggleSubagents(session.id));
     onSession('session-rename', session => this._showRenameDialog(session));
     onSession('session-pin', session => this._runSessionAction(
       () => this._api.setPinned(session.id, !session.pinned),
@@ -703,6 +701,17 @@ class UsherWindow extends Adw.ApplicationWindow {
     }
   }
 
+  // Pinning, archiving and the rest change the list, never the conversation.
+  // Reloading the transcript for them costs a fetch and a rebuild of every
+  // turn, which is what made those buttons feel slow.
+  async refreshSessions() {
+    try {
+      this._renderSessions(await this._api.listSessions() || []);
+    } catch (error) {
+      this._showToast(error.message || String(error));
+    }
+  }
+
   // A session that finished answering while it was not on screen stays unread
   // until it is opened. The first poll has no previous status, so a fresh
   // start marks nothing.
@@ -722,10 +731,8 @@ class UsherWindow extends Adw.ApplicationWindow {
   _renderSessions(sessions) {
     this._reconcileUnread(sessions);
     this._sidebar.render(sessions);
-    const selected = this._selectedId ? this._sidebar.rows.get(this._selectedId) : null;
-    if (selected) {
-      this._sidebar.select(selected);
-    } else if (this._selectedId) {
+    const selected = this._selectedId && this._sidebar.selectSession(this._selectedId);
+    if (!selected && this._selectedId) {
       this._selectionEpoch++;
       this._selectedId = null;
       this._eventStream?.stop();
@@ -835,7 +842,7 @@ class UsherWindow extends Adw.ApplicationWindow {
   async _runSessionAction(operation, successMessage) {
     try {
       await operation();
-      await this.refresh();
+      await this.refreshSessions();
       this._showToast(successMessage);
     } catch (error) {
       this._showToast(error.message || String(error));
@@ -1103,8 +1110,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       // Selecting the row only moves the highlight; opening the session is a
       // separate step now that the list no longer drives it.
       await this._selectSession(result.id);
-      const row = this._sidebar.rows.get(result.id);
-      if (row) this._sidebar.select(row);
+      this._sidebar.selectSession(result.id);
     } catch (error) {
       this._showToast(error.message || String(error));
     } finally {
@@ -1153,9 +1159,10 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._windowStart = 0;
     this._transcriptTotal = 0;
     this._loadingEarlier = false;
-    this._status.set_title('Loading session…');
-    this._status.set_description('');
-    this._status.set_visible(true);
+    // Blank, not a status page: opening a session is quick enough that a
+    // "Loading…" screen only registers as a flash. A failure replaces this
+    // with the error page anyway.
+    this._status.set_visible(false);
     this._chatScroll.set_visible(false);
     this._loadEarlier.set_visible(false);
     this._composer.set_visible(false);
@@ -1547,8 +1554,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       // Selecting the row only moves the highlight; opening the session is a
       // separate step now that the list no longer drives it.
       await this._selectSession(result.id);
-      const row = this._sidebar.rows.get(result.id);
-      if (row) this._sidebar.select(row);
+      this._sidebar.selectSession(result.id);
       this._showToast('Forked to a new session');
     } catch (error) {
       this._showToast(error.message || String(error));
@@ -2070,18 +2076,19 @@ class UsherWindow extends Adw.ApplicationWindow {
   // Rebuilds every rendered turn from the data already held, which is what
   // switching between rendered and raw markdown needs; the factory builds the
   // widgets afresh for the replacement items.
+  // Fresh items, so the cached widgets go and every turn is built against the
+  // new render mode. One splice rather than a remove and an append per turn:
+  // each of those is an items-changed the list view has to answer.
   _rerenderTranscript() {
-    this._transcriptStore.remove_all();
-    for (const item of this._renderedTurns) {
-      this._transcriptStore.append(new TranscriptItem(item.turn, item.key));
-    }
+    const items = this._renderedTurns
+      .map(item => new TranscriptItem(item.turn, item.key));
     if (this._optimisticTurn) {
-      this._transcriptStore.append(
-        new TranscriptItem(this._optimisticTurn, '__optimistic__'));
+      items.push(new TranscriptItem(this._optimisticTurn, '__optimistic__'));
     }
     if (this._liveTurn) {
-      this._transcriptStore.append(new TranscriptItem(this._liveTurn, '__live__'));
+      items.push(new TranscriptItem(this._liveTurn, '__live__'));
     }
+    this._transcriptStore.splice(0, this._transcriptStore.get_n_items(), items);
   }
 
   // Replaces the live turn's placeholder text while it has nothing to show.

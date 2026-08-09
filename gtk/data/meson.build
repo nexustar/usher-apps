@@ -19,6 +19,7 @@ install_data(
 # the app carries its own. Namespaced by app id, as app-provided icons are.
 install_data(
   'icons/hicolor/symbolic/apps/io.github.nexustar.Usher-send-symbolic.svg',
+  'icons/hicolor/symbolic/apps/io.github.nexustar.Usher-dot-symbolic.svg',
   install_dir: get_option('datadir') / 'icons/hicolor/symbolic/apps',
 )
 

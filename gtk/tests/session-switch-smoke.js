@@ -43,8 +43,13 @@ const toolWidget = window._transcript.toolWidget({
 });
 if (!toolWidget.has_css_class('tool-card')) throw new Error('tool card style was not applied');
 const archived = sessions.find(session => session.archived);
-if (archived && !window._sidebar.rows.get(archived.id).get_sensitive()) {
-  throw new Error('archived session row is not selectable');
+if (archived) {
+  let found = false;
+  for (let i = 0; i < window._sidebar._store.get_n_items(); i++) {
+    const item = window._sidebar._store.get_item(i);
+    if (item.kind !== 'disclosure' && item.session.id === archived.id) found = true;
+  }
+  if (!found) throw new Error('archived session is missing from the list model');
 }
 
 await window._selectSession('missing-session-for-retry-test');

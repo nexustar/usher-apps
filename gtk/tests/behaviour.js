@@ -47,13 +47,14 @@ const menuLabels = (model, out = []) => {
   }
   return out;
 };
-const sidebarRows = win => {
+const sidebarItems = win => {
   const out = [];
-  for (let r = win._sidebar.sessionList.get_first_child(); r; r = r.get_next_sibling()) {
-    out.push(r);
+  for (let i = 0; i < win._sidebar._store.get_n_items(); i++) {
+    out.push(win._sidebar._store.get_item(i));
   }
   return out;
 };
+const visibleCount = win => win._sidebar._filtered.get_n_items();
 
 let win = null;
 let api = null;
@@ -83,36 +84,63 @@ describe('the app against a live usher', () => {
   });
 
   it('lists the server\'s sessions in the sidebar', () => {
-    expect(win._sidebar.rows.size).toBeWithin(sessions.length, Infinity);
+    expect(win._sidebar._store.get_n_items()).toBeWithin(sessions.length, Infinity);
   });
 
   it('reserves the status slot on every session row', () => {
-    // Idle sessions show no dot, so the slot's job is to hold the column open
-    // and keep the titles lined up.
+    // One recycled row shell, so the slot is fixed by construction; check the
+    // shells the view actually built. Idle sessions show no dot, and the slot
+    // still holds the column open so the titles line up.
     const widths = new Set();
-    for (const row of win._sidebar.rows.values()) {
-      if (row.subagentOf) continue; // read-only children carry no marks
-      widths.add(row.get_child().get_first_child().get_size_request()[0]);
+    for (const box of descend(win._sidebar.listView)) {
+      if (!(box instanceof Gtk.Box) || !box.item) continue;
+      widths.add(box.get_first_child().get_size_request()[0]);
     }
     expect(widths.size).toBe(1);
+    expect([...widths][0]).toBe(10);
+  });
+
+  it('rebuilds the list only when a row would look different', () => {
+    const a = { id: 'a', title: 'A', cwd: '/w', status: 'idle',
+      last_input_at: '2026-01-02T00:00:00Z' };
+    const b = { id: 'b', title: 'B', cwd: '/w', status: 'idle',
+      last_input_at: '2026-01-01T00:00:00Z' };
+    try {
+      win._sidebar.render([a, b]);
+      const digest = win._sidebar.sessionsDigest;
+      // A later event that reorders nothing and changes nothing on screen:
+      // the poll delivers these constantly.
+      win._sidebar.render([{ ...a, last_event_at: '2026-01-02T00:00:01Z' }, b]);
+      expect(win._sidebar.sessionsDigest).toBe(digest);
+      win._sidebar.render([{ ...a, title: 'A renamed' }, b]);
+      expect(win._sidebar.sessionsDigest === digest).toBeFalsy();
+    } finally {
+      win._sidebar.sessionsDigest = null;
+      win._renderSessions(sessions);
+    }
   });
 
   it('hides the rows the search text does not match', async () => {
-    const row = win._sidebar.rows.get(sessions[0].id);
+    const before = visibleCount(win);
     win._search.set_text('zzzz-nothing-matches-this');
-    await until('the list to filter', () => !row.get_child_visible());
+    await until('the filter to empty the list', () => visibleCount(win) === 0);
+    // With nothing left the empty page takes over from the list.
+    expect(win._sidebar.widget.get_visible_child_name()).toBe('empty');
+    expect(win._sidebar._placeholder.get_label()).toBe('No sessions match the search');
     win._search.set_text('');
-    await until('the list to come back', () => row.get_child_visible());
+    await until('the list to come back', () => visibleCount(win) === before);
+    expect(win._sidebar.widget.get_visible_child_name()).toBe('list');
   });
 
   it('opens a menu on the row and marks it while the menu is up', async () => {
-    const row = win._sidebar.rows.get(sessions[0].id);
-    win._showRowMenu(sessions[0], row, 4, 4);
-    expect(row.has_css_class('has-open-popup')).toBeTruthy();
-    const popover = descend(row).find(w => w instanceof Gtk.PopoverMenu);
+    const anchor = win._sidebar.listView;
+    win._showRowMenu(sessions[0], anchor, 4, 4);
+    expect(anchor.has_css_class('has-open-popup')).toBeTruthy();
+    const popover = descend(anchor).find(w => w instanceof Gtk.PopoverMenu);
     expect(popover).toBeTruthy();
     popover.popdown();
-    await until('the row to be released', () => !row.has_css_class('has-open-popup'));
+    await until('the anchor to be released',
+      () => !anchor.has_css_class('has-open-popup'));
   });
 
   it('names the session actions in the menu model', () => {
@@ -123,15 +151,20 @@ describe('the app against a live usher', () => {
   });
 
   it('folds a directory group\'s archived sessions behind one row', () => {
-    const rows = sidebarRows(win);
-    const toggle = rows.find(r => r.archivedToggle);
+    const items = sidebarItems(win);
+    const toggle = items.find(i => i.kind === 'disclosure' && i.disclosure === 'toggle');
     if (!toggle) return; // nothing archived on this server
-    const archived = rows.find(r => r.archived && r.groupKey === toggle.groupKey);
-    expect(win._sidebar.rowMatches(archived)).toBeFalsy();
-    toggle.onActivate();
-    expect(win._sidebar.rowMatches(archived)).toBeTruthy();
-    toggle.onActivate();
-    expect(win._sidebar.rowMatches(archived)).toBeFalsy();
+    const archived = items.find(i => i.archived && i.groupKey === toggle.groupKey);
+    expect(win._sidebar.itemMatches(archived)).toBeFalsy();
+    win._sidebar._activateDisclosure(toggle);
+    expect(win._sidebar.itemMatches(archived)).toBeTruthy();
+    win._sidebar._activateDisclosure(toggle);
+    expect(win._sidebar.itemMatches(archived)).toBeFalsy();
+  });
+
+  it('opens a session on a single click', () => {
+    // GtkListBox activated on one click; a list view needs to be told to.
+    expect(win._sidebar.listView.get_single_click_activate()).toBeTruthy();
   });
 
   it('opens a session on activation, not on selection', async () => {
@@ -139,9 +172,14 @@ describe('the app against a live usher', () => {
     await win._selectSession(sessions[0].id);
     // GtkListBox moves the selection by itself when the list is filtered or
     // rebuilt; only a click or Enter may open a session.
-    win._sidebar.select(win._sidebar.rows.get(target.id));
+    win._sidebar.selectSession(target.id);
     expect(win._selectedId).toBe(sessions[0].id);
-    win._sidebar.sessionList.emit('row-activated', win._sidebar.rows.get(target.id));
+    let position = -1;
+    for (let i = 0; i < win._sidebar._filtered.get_n_items(); i++) {
+      const item = win._sidebar._filtered.get_item(i);
+      if (item.kind !== 'disclosure' && item.session.id === target.id) position = i;
+    }
+    win._sidebar.listView.emit('activate', position);
     await until('the session to open', () => win._selectedId === target.id);
   });
 

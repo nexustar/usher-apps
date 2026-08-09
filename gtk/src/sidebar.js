@@ -1,11 +1,24 @@
 // The session list: grouping by directory, archived disclosure, and the
 // subagents hanging off their parent.
 //
+// A GtkListView over list models rather than rows appended to a GtkListBox:
+// the view recycles a handful of row widgets instead of building one per
+// session, filtering is the model's job, and the directory headings come from
+// the view's header factory.
+//
+// The order is still computed here. Expressing "pinned first, then directories
+// by recency, subagents under their parent, archived at the end" as a
+// comparator over a heterogeneous list is far less readable than one pass, so
+// each item carries the position that pass gave it and the sorters only read
+// those numbers back.
+//
 // The sidebar owns the list widget and the state that only it reads — which
 // groups are expanded, how many archived rows have been paged in. Everything
 // about the selection stays with the window.
 
 import Gdk from 'gi://Gdk?version=4.0';
+import Gio from 'gi://Gio';
+import GObject from 'gi://GObject';
 import Gtk from 'gi://Gtk?version=4.0';
 import Pango from 'gi://Pango';
 
@@ -16,44 +29,84 @@ const ARCHIVED_PAGE_SIZE = 20;
 // of row padding. Group headings match it; rows add nothing on top of it.
 const ROW_INSET = 14;
 
-// The status dot gets a slot of its own so every title starts in one column.
-// The auto-approve bolt does not: it is rare, and reserving a column for it
-// would push every title across the sidebar to buy alignment on a few rows.
-// The web sidebar sets both inline for the same reason.
+// The status icon sits in a slot of its own whether or not the session has
+// one to show, so every title starts in the same column. The slot is sized
+// for the mark rather than for a full icon: this list is titles, and a wider
+// gutter would push every one of them across the sidebar.
 const STATUS_SLOT = 10;
 const SLOT_GAP = 4;
 
-// Where the titles start, and so where a subagent row and a disclosure row
-// start too.
+// Where the titles start, and so where a disclosure row starts too.
 const TITLE_INSET = STATUS_SLOT + SLOT_GAP;
 
-// ctx: { selectedId(), searchQuery(), onSelect(id) }
+// Subagents sit one step further in than their parent's title, which is what
+// says they are nested — no marker glyph.
+const CHILD_INDENT = TITLE_INSET + 16;
+
+const DOT_STATES = ['permission', 'unread', 'running', 'live'];
+
+// One entry in the list. Sessions, their subagents and the archived
+// disclosures all travel as these, because a list view takes one model.
+const SidebarItem = GObject.registerClass(
+class SidebarItem extends GObject.Object {
+  _init(fields) {
+    super._init();
+    Object.assign(this, fields);
+  }
+});
+
+// ctx: { selectedId(), searchQuery(), onSelect(id), onContextMenu(),
+//        interactionCount(id), isUnread(id) }
 export class Sidebar {
   constructor(ctx) {
     this._ctx = ctx;
-    this.rows = new Map();
     this.sessionsById = new Map();
     this.sessionsDigest = null;
     this.expandedSubagents = new Set();
     this.expandedArchived = new Set();
     this.archivedPages = new Map();
     this._subagentCounts = new Map();
-    this._disclosures = new Map();
-    this.sessionList = new Gtk.ListBox({ selection_mode: Gtk.SelectionMode.SINGLE });
-    this.sessionList.add_css_class('navigation-sidebar');
-    this.sessionList.add_css_class('session-list');
-    this.sessionList.set_filter_func(row => this.rowMatches(row));
-    this.sessionList.set_header_func((row, before) => this._setHeader(row, before));
-    // Activation, not selection, is what opens a session. GtkListBox moves the
-    // selection on its own whenever filtering or a rebuild disturbs which row
-    // is current, and treating that as a choice would load a session nobody
+    this._archivedCounts = new Map();
+
+    this._store = new Gio.ListStore({ item_type: SidebarItem });
+    const sorted = new Gtk.SortListModel({
+      model: this._store,
+      sorter: Gtk.CustomSorter.new((a, b) => a.order - b.order),
+      // Coarser than the sorter above, which is what a section sorter has to
+      // be: it reads back the group the same pass assigned.
+      section_sorter: Gtk.CustomSorter.new((a, b) => a.sectionOrder - b.sectionOrder),
+    });
+    this._filtered = new Gtk.FilterListModel({
+      model: sorted,
+      filter: Gtk.CustomFilter.new(item => this.itemMatches(item)),
+    });
+    this._selection = new Gtk.SingleSelection({
+      model: this._filtered,
+      autoselect: false,
+      can_unselect: true,
+    });
+
+    this.listView = new Gtk.ListView({
+      model: this._selection,
+      factory: this._rowFactory(),
+      header_factory: this._headerFactory(),
+      // GtkListBox activates on a single click; a list view does not unless
+      // told to, which would leave a session needing a double click to open.
+      single_click_activate: true,
+    });
+    this.listView.add_css_class('navigation-sidebar');
+    this.listView.add_css_class('session-list');
+    // Activation, not selection, is what opens a session. A selection model
+    // moves the selection on its own whenever filtering disturbs which row is
+    // current, and treating that as a choice would load a session nobody
     // asked for — and file the draft being typed under it. Activation only
-    // comes from a click or Enter, which is the same split arrow-key
-    // navigation expects.
-    this.sessionList.connect('row-activated', (_list, row) => {
-      if (row.onActivate) return row.onActivate();
-      if (row.sessionId && row.sessionId !== this._ctx.selectedId()) {
-        this._ctx.onSelect(row.sessionId);
+    // comes from a click or Enter, the same split arrow-key navigation wants.
+    this.listView.connect('activate', (_view, position) => {
+      const item = this._filtered.get_item(position);
+      if (!item) return;
+      if (item.kind === 'disclosure') return this._activateDisclosure(item);
+      if (item.session.id !== this._ctx.selectedId()) {
+        this._ctx.onSelect(item.session.id);
       }
     });
     // The context menu has to be reachable without a pointer.
@@ -62,64 +115,235 @@ export class Sidebar {
       const menuKey = keyval === Gdk.KEY_Menu ||
         (keyval === Gdk.KEY_F10 && (state & Gdk.ModifierType.SHIFT_MASK));
       if (!menuKey) return false;
-      const row = this.sessionList.get_selected_row();
-      const session = row && this.sessionsById.get(row.sessionId);
-      if (!session) return false;
-      this._ctx.onContextMenu(session, row, 0, row.get_height() / 2);
+      const item = this._selection.get_selected_item();
+      if (!item || item.kind === 'disclosure') return false;
+      this._ctx.onContextMenu(item.session, this.listView, 0, 0);
       return true;
     });
-    this.sessionList.add_controller(keys);
-    this.widget = new Gtk.ScrolledWindow({ hscrollbar_policy: Gtk.PolicyType.NEVER });
-    this.widget.set_child(this.sessionList);
-    this.widget.set_vexpand(true);
-  }
+    this.listView.add_controller(keys);
 
-  _setHeader(row, before) {
-    if (before && before.groupKey === row.groupKey) {
-      row.set_header(null);
-      return;
-    }
-    const label = new Gtk.Label({
-      label: row.groupLabel,
-      xalign: 0,
-      ellipsize: Pango.EllipsizeMode.MIDDLE,
-      max_width_chars: 32,
-      tooltip_text: row.groupLabel,
+    const scroller = new Gtk.ScrolledWindow({ hscrollbar_policy: Gtk.PolicyType.NEVER });
+    scroller.set_child(this.listView);
+    scroller.set_vexpand(true);
+
+    // A list view has no placeholder of its own, so the empty state is a
+    // sibling page: it covers both an empty server and a search that matched
+    // nothing.
+    this._placeholder = new Gtk.Label({
+      label: 'No sessions found',
       margin_top: 12,
-      margin_bottom: 4,
-      // Lines the heading up with the row content below it: rows carry a 6px
-      // margin and 8px of padding from .navigation-sidebar.
       margin_start: ROW_INSET,
       margin_end: ROW_INSET,
+      wrap: true,
+      xalign: 0,
+      valign: Gtk.Align.START,
     });
-    label.add_css_class('caption-heading');
-    label.add_css_class('dim-label');
-    row.set_header(label);
+    this._placeholder.add_css_class('dim-label');
+    this.widget = new Gtk.Stack({ vexpand: true });
+    this.widget.add_named(scroller, 'list');
+    this.widget.add_named(this._placeholder, 'empty');
+    this._filtered.connect('items-changed', () => this._syncPlaceholder());
+    this._syncPlaceholder();
   }
 
-  rowFor(id) {
-    return this.rows.get(id);
+  _syncPlaceholder() {
+    this._placeholder.set_label(this._ctx.searchQuery()
+      ? 'No sessions match the search' : 'No sessions found');
+    this.widget.set_visible_child_name(
+      this._filtered.get_n_items() === 0 ? 'empty' : 'list');
   }
 
-  select(row) {
-    this.sessionList.select_row(row);
+  // One row widget, reused by the view for whatever item lands in it. setup
+  // builds the shell once; bind only fills it in, which is the point of a
+  // list view — the old list box rebuilt every row on every change.
+  _rowFactory() {
+    const factory = new Gtk.SignalListItemFactory();
+    factory.connect('setup', (_f, listItem) => {
+      const content = new Gtk.Box({
+        orientation: Gtk.Orientation.HORIZONTAL,
+        spacing: SLOT_GAP,
+      });
+      const slot = new Gtk.Box({
+        valign: Gtk.Align.CENTER,
+        halign: Gtk.Align.CENTER,
+        hexpand: false,
+      });
+      slot.set_size_request(STATUS_SLOT, -1);
+      // A symbolic icon rather than a bullet character: it is what GNOME uses
+      // for a status mark, and it is not at the mercy of the font.
+      const dot = new Gtk.Image({
+        icon_name: 'io.github.nexustar.Usher-dot-symbolic',
+        pixel_size: STATUS_SLOT,
+        valign: Gtk.Align.CENTER,
+      });
+      dot.add_css_class('session-dot');
+      slot.append(dot);
+      content.append(slot);
+      const title = new Gtk.Label({
+        xalign: 0,
+        hexpand: true,
+        single_line_mode: true,
+        ellipsize: Pango.EllipsizeMode.END,
+      });
+      content.append(title);
+      const badge = new Gtk.Label({ valign: Gtk.Align.CENTER, visible: false });
+      badge.add_css_class('session-count');
+      content.append(badge);
+      const arrow = new Gtk.Image({
+        icon_name: 'pan-up-symbolic', valign: Gtk.Align.CENTER, visible: false,
+      });
+      arrow.add_css_class('session-disclosure');
+      content.append(arrow);
+      listItem.set_child(content);
+      listItem.parts = { slot, dot, title, badge, arrow, content };
+
+      // The row is read back off the gesture rather than captured: a closure a
+      // widget owns that also refers to that widget is a cycle across the JS
+      // and GObject heaps, and nothing can collect it.
+      const menu = new Gtk.GestureClick({ button: 3 });
+      menu.connect('pressed', (gesture, _n, x, y) => {
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED);
+        this._openMenuFor(gesture.get_widget(), x, y);
+      });
+      content.add_controller(menu);
+      const held = new Gtk.GestureLongPress({ touch_only: true });
+      held.connect('pressed', (gesture, x, y) => {
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED);
+        this._openMenuFor(gesture.get_widget(), x, y);
+      });
+      content.add_controller(held);
+    });
+
+    factory.connect('bind', (_f, listItem) => this._bindRow(listItem));
+    return factory;
+  }
+
+  _bindRow(listItem) {
+    const item = listItem.get_item();
+    const { slot, dot, title, badge, arrow, content } = listItem.parts;
+    content.item = item;
+    const child = item.kind === 'subagent';
+    const disclosure = item.kind === 'disclosure';
+
+    content.set_margin_start(
+      child ? CHILD_INDENT : (disclosure ? TITLE_INSET : 0));
+    slot.set_visible(!child && !disclosure);
+    arrow.set_visible(disclosure && item.disclosure === 'toggle');
+    listItem.set_selectable(!disclosure);
+    title.remove_css_class('caption');
+    title.remove_css_class('dim-label');
+    content.remove_css_class('dim-label');
+
+    if (disclosure) {
+      title.add_css_class('caption');
+      title.add_css_class('dim-label');
+      title.set_label(item.label);
+      title.set_tooltip_text(null);
+      badge.set_visible(false);
+      if (item.disclosure === 'toggle') {
+        if (this.expandedArchived.has(item.groupKey)) arrow.remove_css_class('collapsed');
+        else arrow.add_css_class('collapsed');
+      }
+      return;
+    }
+
+    const session = item.session;
+    title.set_label(item.title);
+    title.set_tooltip_text(item.title);
+    // Subagents step down in size, not in contrast — dim is what archived
+    // looks like. Dimming the content rather than the row keeps the row's
+    // selection highlight at full strength.
+    if (child) title.add_css_class('caption');
+    if (item.archived) content.add_css_class('dim-label');
+
+    const state = this._dotState(session);
+    for (const css of DOT_STATES) dot.remove_css_class(css);
+    dot.set_visible(Boolean(state));
+    if (state) {
+      dot.add_css_class(state);
+      dot.set_tooltip_text(state === 'permission' ? 'Waiting for a decision'
+        : state === 'unread' ? 'New response'
+          : state === 'running' ? 'Running' : 'Worker live');
+    }
+
+    const waiting = child ? 0 : this._ctx.interactionCount(session.id);
+    badge.set_visible(waiting > 0);
+    if (waiting > 0) {
+      badge.set_label(`${waiting}`);
+      badge.set_tooltip_text(
+        `${waiting} decision${waiting === 1 ? '' : 's'} waiting`);
+    }
+  }
+
+  // The directory heading above each section, which the section sorter marks
+  // out for the view.
+  _headerFactory() {
+    const factory = new Gtk.SignalListItemFactory();
+    factory.connect('setup', (_f, header) => {
+      const label = new Gtk.Label({
+        xalign: 0,
+        ellipsize: Pango.EllipsizeMode.MIDDLE,
+        max_width_chars: 32,
+        margin_top: 12,
+        margin_bottom: 4,
+        // Lines the heading up with the row content below it.
+        margin_start: ROW_INSET,
+        margin_end: ROW_INSET,
+      });
+      label.add_css_class('caption-heading');
+      label.add_css_class('dim-label');
+      header.set_child(label);
+    });
+    factory.connect('bind', (_f, header) => {
+      const label = header.get_item()?.sectionLabel || '';
+      header.get_child().set_label(label);
+      header.get_child().set_tooltip_text(label);
+      // The gap belongs between groups, not above the first one — where it
+      // would just be dead space at the top of the list.
+      header.get_child().set_margin_top(header.get_start() === 0 ? 2 : 12);
+    });
+    return factory;
+  }
+
+  _openMenuFor(widget, x, y) {
+    const item = widget?.item;
+    if (!item || item.kind === 'disclosure') return;
+    this._ctx.onContextMenu(item.session, widget, x, y);
+  }
+
+  _dotState(session) {
+    if (this._ctx.interactionCount(session.id) > 0 ||
+        session.status === 'awaiting_permission') return 'permission';
+    if (this._ctx.isUnread(session.id)) return 'unread';
+    if (session.status === 'running') return 'running';
+    if (session.status === 'live') return 'live';
+    return '';
+  }
+
+  selectSession(id) {
+    for (let i = 0; i < this._filtered.get_n_items(); i++) {
+      const item = this._filtered.get_item(i);
+      if (item.kind !== 'disclosure' && item.session.id === id) {
+        this._selection.set_selected(i);
+        return true;
+      }
+    }
+    return false;
   }
 
   unselectAll() {
-    this.sessionList.unselect_all();
+    this._selection.set_selected(Gtk.INVALID_LIST_POSITION);
   }
 
   clear() {
-    let child;
-    while ((child = this.sessionList.get_first_child())) this.sessionList.remove(child);
-    this.rows.clear();
+    this._store.remove_all();
     this.sessionsById = new Map();
     this.sessionsDigest = null;
   }
 
   refilter() {
-    this.sessionList.invalidate_filter();
-    this.sessionList.invalidate_headers();
+    this._filtered.get_filter().changed(Gtk.FilterChange.DIFFERENT);
+    this._syncPlaceholder();
   }
 
   render(all) {
@@ -154,259 +378,142 @@ export class Sidebar {
 
     this.sessionsById = new Map(all.map(session => [session.id, session]));
 
-    // Rebuilding tears down open popovers and selection feedback, so skip
-    // the write when the poll delivered identical data. Pending interactions
-    // are part of what a row draws, so they are part of what makes it stale.
-    const digest = JSON.stringify(all) + all.map(session =>
-      `${this._ctx.interactionCount(session.id)}${this._ctx.isUnread(session.id)}`).join(',');
+    // Skip the write when nothing a row draws has changed. Digesting the raw
+    // sessions would rebuild on every poll: their timestamps tick constantly
+    // and only matter here through the ordering, which the sorted array
+    // already captures.
+    const digest = sessions.map(session => [
+      session.id, session.title, session.cwd, session.status,
+      session.pinned ? 1 : 0, session.archived ? 1 : 0,
+      this._ctx.interactionCount(session.id), this._ctx.isUnread(session.id) ? 1 : 0,
+      ...(children.get(session.id) || [])
+        .map(child => [child.id, child.agent_name || child.title, child.status].join('~')),
+    ].join('|')).join('\n');
     if (digest === this.sessionsDigest) return;
     this.sessionsDigest = digest;
 
-    let child;
-    while ((child = this.sessionList.get_first_child())) this.sessionList.remove(child);
-    this.rows.clear();
-    this._disclosures.clear();
+    const items = [];
+    const sections = new Map();
+    this._subagentCounts.clear();
+    this._archivedCounts.clear();
 
-    // Each directory group ends with its own archived disclosure. It is a real
-    // row rather than a filtered-away header control, because a group whose
-    // sessions are *all* archived would otherwise disappear entirely, leaving
-    // nothing to click.
-    let openGroup = null;
+    let group = null;
     let archivedInGroup = 0;
     const closeGroup = () => {
-      if (openGroup === null || !archivedInGroup) {
-        openGroup = null;
-        archivedInGroup = 0;
-        return;
+      if (group && archivedInGroup) {
+        this._archivedCounts.set(group.key, archivedInGroup);
+        // Two rows: one that folds the group's archived sessions away, and —
+        // once open, while any are still held back — one that pages in the
+        // next batch. Rows rather than buttons inside a row, which is how the
+        // collapsible sections in GNOME's own sidebars are built.
+        for (const disclosure of ['toggle', 'more']) {
+          items.push(new SidebarItem({
+            kind: 'disclosure',
+            disclosure,
+            groupKey: group.key,
+            order: items.length,
+            sectionOrder: group.sectionOrder,
+            sectionLabel: group.label,
+            label: '',
+          }));
+        }
       }
-      for (const row of this.archivedRows(openGroup, archivedInGroup)) {
-        this.sessionList.append(row);
-      }
-      openGroup = null;
       archivedInGroup = 0;
     };
 
     for (const session of sessions) {
+      const key = session.pinned ? 'pinned' : (session.cwd || '(unknown)');
+      const label = session.pinned ? 'Pinned' : (session.cwd || '(unknown)');
+      if (!sections.has(key)) sections.set(key, sections.size);
+      if (group?.key !== key) {
+        closeGroup();
+        group = { key, label, sectionOrder: sections.get(key) };
+      }
+
       this._subagentCounts.set(session.id, (children.get(session.id) || []).length);
-      const row = this._sessionRow(session);
-      row.groupKey = session.pinned ? '\u0000pinned' : (session.cwd || '(unknown)');
-      row.groupLabel = session.pinned ? 'Pinned' : (session.cwd || '(unknown)');
-      if (row.groupKey !== openGroup) closeGroup();
-      openGroup = row.groupKey;
-      if (session.archived) row.archivedIndex = archivedInGroup++;
-      this.sessionList.append(row);
-      this.rows.set(session.id, row);
+      items.push(new SidebarItem({
+        kind: 'session',
+        session,
+        title: session.title || '(untitled)',
+        searchText: `${session.title || ''} ${session.cwd || ''}`.toLowerCase(),
+        groupKey: key,
+        archived: Boolean(session.archived),
+        archivedIndex: session.archived ? archivedInGroup++ : -1,
+        order: items.length,
+        sectionOrder: group.sectionOrder,
+        sectionLabel: label,
+      }));
 
       for (const child of children.get(session.id) || []) {
-        const childRow = this._sessionRow(child, { child: true });
-        childRow.subagentOf = session.id;
-        childRow.groupKey = row.groupKey;
-        childRow.groupLabel = row.groupLabel;
-        this.sessionList.append(childRow);
-        this.rows.set(child.id, childRow);
+        items.push(new SidebarItem({
+          kind: 'subagent',
+          session: child,
+          title: child.agent_name || child.title || '(subagent)',
+          searchText: `${child.agent_name || child.title || ''}`.toLowerCase(),
+          groupKey: key,
+          subagentOf: session.id,
+          archived: Boolean(session.archived),
+          archivedIndex: -1,
+          order: items.length,
+          sectionOrder: group.sectionOrder,
+          sectionLabel: label,
+        }));
       }
     }
     closeGroup();
+    for (const item of items) {
+      if (item.kind === 'disclosure') this._labelDisclosure(item);
+    }
+
+    // One splice: the view answers a single items-changed and rebinds only
+    // the rows it is showing.
+    this._store.splice(0, this._store.get_n_items(), items);
     this.refilter();
   }
 
-  // One row: the leading marks, the title, and — when a session is holding
-  // decisions — a count at the end.
-  //
-  // Per-session actions live in a context menu rather than a button on each
-  // row, which is what GTK sidebars do (GNOME Builder's project tree,
-  // Fractal's room list); the conversation header offers the same menu.
-  _sessionRow(session, { child = false } = {}) {
-    const title = child
-      ? (session.agent_name || session.title || '(subagent)')
-      : (session.title || '(untitled)');
-    const row = new Gtk.ListBoxRow({
-      activatable: true,
-      selectable: true,
-      tooltip_text: title,
-    });
-    row.sessionId = session.id;
-    row.searchText = `${title} ${session.cwd || ''}`.toLowerCase();
-
-    // No margins of our own: .navigation-sidebar already insets the row and
-    // sets its height.
-    const content = new Gtk.Box({
-      orientation: Gtk.Orientation.HORIZONTAL,
-      spacing: SLOT_GAP,
-      margin_start: child ? TITLE_INSET : 0,
-    });
-    // A subagent is a read-only child of the turn that spawned it: no state of
-    // its own to act on, so no marks — it starts where its parent's title
-    // does and the web sidebar's dash is what says it is nested.
-    if (!child) content.append(this._slot(STATUS_SLOT, this._statusDot(session)));
-    const label = new Gtk.Label({
-      label: child ? `- ${title}` : title,
-      xalign: 0,
-      hexpand: true,
-      single_line_mode: true,
-      ellipsize: Pango.EllipsizeMode.END,
-    });
-    // Subagents step down in size, not in contrast — dim is what archived
-    // looks like.
-    if (child) {
-      label.add_css_class('caption');
-      row.add_css_class('subagent');
-    }
-    content.append(label);
-
-    const waiting = this._ctx.interactionCount(session.id);
-    if (waiting) {
-      const badge = new Gtk.Label({ label: `${waiting}`, valign: Gtk.Align.CENTER });
-      badge.add_css_class('session-count');
-      badge.set_tooltip_text(
-        `${waiting} decision${waiting === 1 ? '' : 's'} waiting`);
-      content.append(badge);
-    }
-    row.set_child(content);
-    if (session.archived) {
-      // On the content, not the row: dimming the row would take its selection
-      // highlight with it.
-      content.add_css_class('dim-label');
-      row.archived = true;
-    }
-
-    // The row is read back off the gesture rather than captured: a closure a
-    // widget owns that also refers to that widget is a cycle across the JS and
-    // GObject heaps, and nothing can collect it. The list rebuilds on every
-    // change, so one such row per rebuild is a steady leak.
-    const menu = new Gtk.GestureClick({ button: 3 });
-    menu.connect('pressed', (gesture, _n, x, y) => {
-      // Claim it, or the list box treats the same press as a click on the row.
-      gesture.set_state(Gtk.EventSequenceState.CLAIMED);
-      this._ctx.onContextMenu(session, gesture.get_widget(), x, y);
-    });
-    row.add_controller(menu);
-    const held = new Gtk.GestureLongPress({ touch_only: true });
-    held.connect('pressed', (gesture, x, y) => {
-      gesture.set_state(Gtk.EventSequenceState.CLAIMED);
-      this._ctx.onContextMenu(session, gesture.get_widget(), x, y);
-    });
-    row.add_controller(held);
-    return row;
+  _labelDisclosure(item) {
+    item.label = item.disclosure === 'toggle'
+      ? `${this._archivedCounts.get(item.groupKey) || 0} archived`
+      : `Show ${this._heldBack(item.groupKey)} more`;
   }
 
-  // hexpand must stay off: it would propagate to the slot and let it compete
-  // with the title for the row's spare width.
-  _slot(width, child) {
-    const slot = new Gtk.Box({
-      valign: Gtk.Align.CENTER,
-      halign: Gtk.Align.CENTER,
-      hexpand: false,
-    });
-    slot.set_size_request(width, -1);
-    if (child) slot.append(child);
-    return slot;
+  _heldBack(groupKey) {
+    if (!this.expandedArchived.has(groupKey)) return 0;
+    return Math.max(0, (this._archivedCounts.get(groupKey) || 0) -
+      this.archivedVisible(groupKey));
   }
 
-  // Idle — no process held for the session — shows nothing; the slot stays to
-  // keep the titles in one column.
-  _statusDot(session) {
-    const state = this._ctx.interactionCount(session.id) > 0 ||
-      session.status === 'awaiting_permission' ? 'permission'
-      : this._ctx.isUnread(session.id) ? 'unread'
-        : session.status === 'running' ? 'running'
-          : session.status === 'live' ? 'live' : '';
-    if (!state) return null;
-    const dot = new Gtk.Label({ label: '●', valign: Gtk.Align.CENTER });
-    dot.add_css_class('session-dot');
-    dot.add_css_class(state);
-    dot.set_tooltip_text(state === 'permission' ? 'Waiting for a decision'
-      : state === 'unread' ? 'New response'
-        : state === 'running' ? 'Running' : 'Worker live');
-    return dot;
+  _activateDisclosure(item) {
+    if (item.disclosure === 'toggle') {
+      if (this.expandedArchived.has(item.groupKey)) {
+        this.expandedArchived.delete(item.groupKey);
+        this.archivedPages.delete(item.groupKey);
+      } else {
+        this.expandedArchived.add(item.groupKey);
+        this.archivedPages.set(item.groupKey, ARCHIVED_PAGE_SIZE);
+      }
+    } else {
+      this.archivedPages.set(
+        item.groupKey, this.archivedVisible(item.groupKey) + ARCHIVED_PAGE_SIZE);
+    }
+    for (let i = 0; i < this._store.get_n_items(); i++) {
+      const other = this._store.get_item(i);
+      if (other.kind === 'disclosure' && other.groupKey === item.groupKey) {
+        this._labelDisclosure(other);
+      }
+    }
+    this.refilter();
   }
 
   subagentCount(sessionId) {
-    return [...this.rows.values()].filter(r => r.subagentOf === sessionId).length ||
-      this._subagentCounts.get(sessionId) || 0;
+    return this._subagentCounts.get(sessionId) || 0;
   }
 
   toggleSubagents(sessionId) {
     if (this.expandedSubagents.has(sessionId)) this.expandedSubagents.delete(sessionId);
     else this.expandedSubagents.add(sessionId);
-    // The child rows are always built; only the filter decides who sees them.
     this.refilter();
     return this.expandedSubagents.has(sessionId);
-  }
-
-  // The rows that end a directory group: one that folds the group's archived
-  // sessions away, and — once it is open and any are still held back — one
-  // that pages in the next batch. Rows rather than buttons inside a row: a
-  // list entry whose whole job is to be pressed is a row, which is how the
-  // collapsible sections in GNOME's own sidebars are built.
-  // The pair is kept on the sidebar, not closed over by the rows' handlers: a
-  // handler a row owns that refers back to that row (or to its sibling, which
-  // refers back in turn) is a cycle across the JS and GObject heaps that
-  // nothing can collect. The map is dropped on the next rebuild, so the rows
-  // go with it.
-  archivedRows(groupKey, count) {
-    const arrow = new Gtk.Image({
-      icon_name: 'pan-up-symbolic',
-      valign: Gtk.Align.CENTER,
-    });
-    arrow.add_css_class('session-disclosure');
-    const toggle = this._disclosureRow(groupKey, arrow, 'toggle');
-    const more = this._disclosureRow(groupKey, null, 'more');
-    this._disclosures.set(groupKey, { toggle, more, arrow, count });
-    this._syncDisclosure(groupKey);
-    return [toggle, more];
-  }
-
-  _activateDisclosure(groupKey, which) {
-    if (which === 'toggle') {
-      if (this.expandedArchived.has(groupKey)) {
-        this.expandedArchived.delete(groupKey);
-        this.archivedPages.delete(groupKey);
-      } else {
-        this.expandedArchived.add(groupKey);
-        this.archivedPages.set(groupKey, ARCHIVED_PAGE_SIZE);
-      }
-    } else {
-      this.archivedPages.set(
-        groupKey, this.archivedVisible(groupKey) + ARCHIVED_PAGE_SIZE);
-    }
-    this._syncDisclosure(groupKey);
-    this.refilter();
-  }
-
-  _syncDisclosure(groupKey) {
-    const group = this._disclosures.get(groupKey);
-    if (!group) return;
-    const expanded = this.expandedArchived.has(groupKey);
-    group.toggle.setLabel(`${group.count} archived`);
-    if (expanded) group.arrow.remove_css_class('collapsed');
-    else group.arrow.add_css_class('collapsed');
-    const held = expanded
-      ? Math.max(0, group.count - this.archivedVisible(groupKey)) : 0;
-    group.more.setLabel(`Show ${held} more`);
-    group.more.set_visible(held > 0);
-  }
-
-  _disclosureRow(groupKey, arrow, which) {
-    const row = new Gtk.ListBoxRow({ activatable: true, selectable: false });
-    row.archivedToggle = true;
-    row.groupKey = groupKey;
-    row.groupLabel = groupKey;
-    row.onActivate = () => this._activateDisclosure(groupKey, which);
-    const content = new Gtk.Box({
-      orientation: Gtk.Orientation.HORIZONTAL,
-      spacing: SLOT_GAP,
-      // Starts where the session titles above it start.
-      margin_start: TITLE_INSET,
-    });
-    const text = new Gtk.Label({ xalign: 0, hexpand: true });
-    text.add_css_class('caption');
-    text.add_css_class('dim-label');
-    content.append(text);
-    if (arrow) content.append(arrow);
-    row.set_child(content);
-    row.setLabel = value => text.set_label(value);
-    return row;
   }
 
   archivedVisible(groupKey) {
@@ -417,13 +524,19 @@ export class Sidebar {
   // group's disclosure is opened. A search reaches them regardless — looking
   // for something is exactly when a hidden session should turn up — and the
   // disclosure rows step aside while the search is active.
-  rowMatches(row) {
+  itemMatches(item) {
     const query = this._ctx.searchQuery();
-    if (row.archivedToggle) return !query;
-    if (row.subagentOf && !this.expandedSubagents.has(row.subagentOf)) return false;
-    if (query) return Boolean(row.searchText?.includes(query));
-    if (!row.archived) return true;
-    return this.expandedArchived.has(row.groupKey) &&
-      row.archivedIndex < this.archivedVisible(row.groupKey);
+    if (item.kind === 'disclosure') {
+      if (query) return false;
+      if (item.disclosure === 'more') return this._heldBack(item.groupKey) > 0;
+      return true;
+    }
+    if (item.kind === 'subagent' && !this.expandedSubagents.has(item.subagentOf)) {
+      return false;
+    }
+    if (query) return Boolean(item.searchText?.includes(query));
+    if (!item.archived) return true;
+    return this.expandedArchived.has(item.groupKey) &&
+      item.archivedIndex < this.archivedVisible(item.groupKey);
   }
 }
