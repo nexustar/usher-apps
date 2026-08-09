@@ -119,8 +119,8 @@ flatpak run io.github.nexustar.Usher
 The manifest tracks the newest stable GNOME runtime, since older ones stop
 receiving security updates; check what that is with `flatpak remote-ls flathub
 --system | grep org.gnome.Platform` and bump both the manifest and the command
-above together. Anything from 47 on works — that is where libadwaita 1.6, and
-so `AdwButtonRow`, arrived.
+above together. Anything from 48 on works — that is where libadwaita 1.7, and
+so `AdwToggleGroup`, arrived.
 
 For a build of the working tree rather than a tag, swap the manifest's `git`
 source for `- type: dir` / `path: ../../..`. Screenshots still have to be added

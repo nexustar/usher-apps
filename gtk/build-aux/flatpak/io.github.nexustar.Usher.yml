@@ -3,7 +3,7 @@
 # the user at `usher serve`.
 id: io.github.nexustar.Usher
 runtime: org.gnome.Platform
-# Floor is 47: libadwaita 1.6, for AdwButtonRow.
+# Floor is 48: libadwaita 1.7, for AdwToggleGroup.
 runtime-version: '50'
 sdk: org.gnome.Sdk
 command: usher-gtk

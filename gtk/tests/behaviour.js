@@ -242,17 +242,13 @@ describe('the app against a live usher', () => {
     win._prompt.get_buffer().set_text('', -1);
   });
 
-  it('keeps the render-mode buttons in one radio group', () => {
-    const options = descend(win).filter(w => w instanceof Gtk.ToggleButton &&
-      w.get_action_name() === 'win.render-mode');
-    expect(options).toHaveLength(2);
-    expect(options[0].get_active()).toBeTruthy();
-    expect(options[1].get_active()).toBeFalsy();
-    options[1].emit('clicked');
-    expect(options[1].get_active()).toBeTruthy();
-    expect(options[0].get_active()).toBeFalsy();
+  it('drives the render mode from the toggle group', () => {
+    const group = descend(win).find(w => w instanceof Adw.ToggleGroup);
+    expect(group).toBeTruthy();
+    expect(group.get_active_name()).toBe('md');
+    group.set_active_name('raw');
     expect(win._rawMarkdown).toBeTruthy();
-    options[0].emit('clicked');
+    group.set_active_name('md');
     expect(win._rawMarkdown).toBeFalsy();
   });
 

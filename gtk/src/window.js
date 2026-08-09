@@ -277,20 +277,23 @@ class UsherWindow extends Adw.ApplicationWindow {
     header.pack_end(this._sessionMenu);
     // How a message is rendered is a standing choice, so it stays visible and
     // says which mode is on — as in the web header — rather than hiding in the
-    // primary menu.
-    const renderMode = new Gtk.Box({ valign: Gtk.Align.CENTER });
-    renderMode.add_css_class('linked');
+    // primary menu. AdwToggleGroup is the platform's segmented control; it
+    // carries the linked shape, the sizing and the radio behaviour.
+    const renderMode = new Adw.ToggleGroup({ valign: Gtk.Align.CENTER });
     renderMode.add_css_class('render-mode');
-    const renderOption = (label, value, tooltip) => {
-      const button = new Gtk.ToggleButton({ label, tooltip_text: tooltip });
-      // A stateful string action drives both buttons, which is what makes them
-      // one radio group: each is active while the state matches its target.
-      button.set_action_name('win.render-mode');
-      button.set_action_target_value(GLib.Variant.new_string(value));
-      renderMode.append(button);
-    };
-    renderOption('md', 'md', 'Render markdown');
-    renderOption('raw', 'raw', 'Show the message as the model wrote it');
+    renderMode.add(new Adw.Toggle({
+      name: 'md', label: 'md', tooltip: 'Render markdown',
+    }));
+    renderMode.add(new Adw.Toggle({
+      name: 'raw', label: 'raw', tooltip: 'Show the message as the model wrote it',
+    }));
+    // AdwToggleGroup is not GtkActionable, so the group drives the action by
+    // hand; the action stays the one place the mode lives.
+    renderMode.set_active_name('md');
+    renderMode.connect('notify::active-name', group => {
+      const mode = group.get_active_name();
+      if (mode) this.activate_action('render-mode', GLib.Variant.new_string(mode));
+    });
     header.pack_end(renderMode);
     contentToolbar.add_top_bar(header);
 

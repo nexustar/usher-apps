@@ -71,22 +71,24 @@ export class TranscriptView {
     return footer;
   }
 
-  // A fork is a prefix copy of the transcript up to this turn — edit-copy is
-  // the closest icon Adwaita ships (there is no dedicated branch/fork glyph).
+  // The web footer's control, verbatim: U+2443 and the word. The glyph needs a
+  // font covering the OCR block (Noto Sans Symbols and friends); without one
+  // GTK draws tofu, with none of a browser's wider fallback.
   forkButton(uuid) {
     const button = new Gtk.Button({
-      icon_name: 'edit-copy-symbolic',
+      label: '\u2443 fork',
       valign: Gtk.Align.CENTER,
       tooltip_text: 'Fork the conversation from here',
     });
     button.add_css_class('flat');
     button.add_css_class('dim-label');
-    button.connect('clicked', async () => {
-      button.set_sensitive(false);
+    button.add_css_class('turn-fork');
+    button.connect('clicked', async self => {
+      self.set_sensitive(false);
       try {
         await this._ctx.onFork(uuid);
       } finally {
-        button.set_sensitive(true);
+        self.set_sensitive(true);
       }
     });
     return button;

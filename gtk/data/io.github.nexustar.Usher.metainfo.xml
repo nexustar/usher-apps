@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
   <id>io.github.nexustar.Usher</id>
-  <name>usher</name>
+  <!-- "desktop" separates this from the web UI's installable PWA, which
+       is also called usher and now carries the same icon. -->
+  <name>usher desktop</name>
   <summary>Manage local coding-agent sessions</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
@@ -53,9 +55,12 @@
   <url type="bugtracker">https://github.com/nexustar/usher-apps/issues</url>
   <url type="vcs-browser">https://github.com/nexustar/usher-apps</url>
 
+  <!-- Taken from the icon: the warm orb for light, its outer falloff for dark.
+       A software centre paints these behind the icon, so they have to be the
+       icon's own palette rather than a generic blue. -->
   <branding>
-    <color type="primary" scheme_preference="light">#c0dcf5</color>
-    <color type="primary" scheme_preference="dark">#1c3552</color>
+    <color type="primary" scheme_preference="light">#f2ddb8</color>
+    <color type="primary" scheme_preference="dark">#352a20</color>
   </branding>
 
   <content_rating type="oars-1.1"/>

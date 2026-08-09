@@ -1,9 +1,10 @@
 [Desktop Entry]
-Name=usher
+Name=usher desktop
 Comment=Manage local coding-agent sessions
 Exec=usher-gtk
 Icon=io.github.nexustar.Usher
 Terminal=false
 Type=Application
 Categories=Development;Utility;
+Keywords=usher;claude;codex;agent;session;
 StartupNotify=true

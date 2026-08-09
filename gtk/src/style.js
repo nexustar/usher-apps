@@ -5,18 +5,29 @@ import Gtk from 'gi://Gtk?version=4.0';
 /* Everything derives from theme tokens (@accent_bg_color, @view_bg_color,
    currentColor) so light and dark Adwaita both look native.
 
-   Corner policy mirrors the usher web UI's scale: 8px for the message bubble
-   and chrome containers (composer, permission card), 4-5px for content
-   blocks (tool cards 4, code 5, tables 4), quotes square with a left bar.
-   Buttons keep the stock Adwaita radius, except the compact md/raw switch,
-   which takes the web pill's 6px. */
-const CSS = `
-.markdown-body {
-  font-size: 0.92em;
-}
+   Type and corners follow the web UI's two scales. The web anchors on a 14px
+   body, so its steps become ems here and prose keeps the inherited size —
+   only what deviates declares one:
 
+     --font-lg   16px  1.15em   titles
+     --font-base 14px  1em      body, controls, rows
+     --font-sm   13px  0.93em   mono data, code, group chrome
+     --font-meta 12px  0.86em   timestamps, roles, micro-labels
+     --font-code       0.9em    inline code, relative to the prose it interrupts
+
+     --radius-sm  4px  chips, menu rows, nested surfaces
+     --radius     6px  standalone controls: buttons, inputs, images
+     --radius-lg  8px  floating panels: composer, popovers, cards
+     --radius-xl 10px  the settings dialog
+
+   Two shapes sit outside the scale in the web too, and so here: the message
+   bubble at 20px and the tool card at 12px. The sidebar row keeps Adwaita's
+   own 9px selection pill rather than the web's 4px — that one is a platform
+   affordance, not a container. */
+const CSS = `
+/* Prose inherits: the web's .content is body size, not a step down. */
 .markdown-heading {
-  font-size: 1em;
+  font-size: 1.15em;
   font-weight: 600;
 }
 
@@ -24,7 +35,7 @@ const CSS = `
    view background. */
 .user-bubble {
   background-color: alpha(@accent_bg_color, 0.18);
-  border-radius: 8px;
+  border-radius: 20px;
 }
 
 /* Tool calls recede into the background: an outline and nothing else, which
@@ -68,7 +79,7 @@ const CSS = `
 }
 
 .tool-header {
-  font-size: 0.80em;
+  font-size: 0.86em;
   font-weight: 600;
   opacity: 0.70;
 }
@@ -89,7 +100,7 @@ const CSS = `
 
 .markdown-code-text {
   font-family: monospace;
-  font-size: 0.9em;
+  font-size: 0.93em;
   padding: 8px;
 }
 
@@ -141,26 +152,25 @@ const CSS = `
   background-color: alpha(currentColor, 0.08);
 }
 
-/* The md/raw switch, sized and cornered like the web's pill rather than a
-   pair of header buttons: Adwaita's 9px on something 24px tall is nearly a
-   capsule, and it would crowd the title at full button width. */
-.render-mode button {
-  min-width: 0;
+/* AdwToggleGroup brings its own shape; only the web pill's type size and
+   compactness are ours. */
+.render-mode {
+  font-size: 0.93em;
+}
+
+.render-mode toggle {
   min-height: 24px;
   padding: 0 8px;
-  font-size: 0.85em;
-  border-radius: 0;
 }
 
-.render-mode button:first-child {
-  border-top-left-radius: 6px;
-  border-bottom-left-radius: 6px;
+/* The fork control is quiet text in the turn footer, the size of the web's. */
+.turn-fork {
+  font-size: 0.86em;
+  font-weight: normal;
+  min-height: 0;
+  padding: 1px 6px;
 }
 
-.render-mode button:last-child {
-  border-top-right-radius: 6px;
-  border-bottom-right-radius: 6px;
-}
 
 /* Session state, mirroring the web sidebar: a dot in a fixed slot so titles
    line up whether or not one is shown. A live worker that is merely warm gets
@@ -215,9 +225,9 @@ const CSS = `
   background: none;
 }
 
-/* Inline transcript images: same 4px content-block radius as tool cards. */
+/* Inline transcript images take the standalone-control radius, as on the web. */
 .transcript-image picture {
-  border-radius: 4px;
+  border-radius: 6px;
 }
 
 .markdown-table-grid {
