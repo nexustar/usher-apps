@@ -150,6 +150,25 @@ describe('the app against a live usher', () => {
     expect(labels.includes('_Pin') || labels.includes('Un_pin')).toBeTruthy();
   });
 
+  it('reveals a session\'s subagents from its menu', () => {
+    const items = sidebarItems(win);
+    const child = items.find(i => i.kind === 'subagent');
+    if (!child) return; // no subagents on this server
+    const parentId = child.subagentOf;
+    expect(win._sidebar.subagentCount(parentId)).toBeWithin(1, Infinity);
+    // Hidden until asked for, and the menu is the only way to ask.
+    expect(win._sidebar.itemMatches(child)).toBeFalsy();
+    const parent = win._sidebar.sessionsById.get(parentId);
+    expect(menuLabels(win._sessionMenuModel(parent, { inSidebar: true }))
+      .some(l => /Subagent/.test(l))).toBeTruthy();
+    win._sidebar.toggleSubagents(parentId);
+    expect(win._sidebar.itemMatches(child)).toBeTruthy();
+    expect(menuLabels(win._sessionMenuModel(parent, { inSidebar: true }))
+      .some(l => /_Hide/.test(l))).toBeTruthy();
+    win._sidebar.toggleSubagents(parentId);
+    expect(win._sidebar.itemMatches(child)).toBeFalsy();
+  });
+
   it('folds a directory group\'s archived sessions behind one row', () => {
     const items = sidebarItems(win);
     const toggle = items.find(i => i.kind === 'disclosure' && i.disclosure === 'toggle');
@@ -323,6 +342,19 @@ describe('the app against a live usher', () => {
     win._syncNewConfig();
     expect(win._newConfig.has_css_class('backend-claude')).toBeTruthy();
     expect(win._newConfig.has_css_class('backend-codex')).toBeFalsy();
+  });
+
+  it('pins a size on the settings dialog', async () => {
+    // Without one it measures against whatever the first page holds, so a
+    // single agent leaves it too small for the form that editing one opens.
+    win._showSettings('agents');
+    // The dialog waits for its first load before presenting, and _showSettings
+    // does not hand back that promise.
+    await until('the settings dialog', () => win.get_visible_dialog());
+    const dialog = win.get_visible_dialog();
+    expect(dialog.get_content_width()).toBeWithin(1, Infinity);
+    expect(dialog.get_content_height()).toBeWithin(1, Infinity);
+    dialog.close();
   });
 
   it('shows context usage in the composer, beside send', () => {

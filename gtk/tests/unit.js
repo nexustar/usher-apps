@@ -3,6 +3,7 @@
 import GLib from 'gi://GLib';
 
 import { describe, it, expect, run } from './harness.js';
+import { fileRef } from '../src/window.js';
 import { ellipsize } from '../src/text.js';
 
 GLib.setenv('XDG_CONFIG_HOME', GLib.dir_make_tmp('usher-unit-XXXXXX'), true);
@@ -107,6 +108,22 @@ describe('sandbox detection', () => {
     } finally {
       GLib.unsetenv('FLATPAK_ID');
     }
+  });
+});
+
+describe('what an upload drops into the message box', () => {
+  it('references an image as markdown so the transcript renders it', () => {
+    expect(fileRef('/tmp/u/shot.png')).toBe('![shot.png](/tmp/u/shot.png)');
+    expect(fileRef('/tmp/u/a.JPEG')).toBe('![a.JPEG](/tmp/u/a.JPEG)');
+  });
+
+  it('wraps a path with a space in the angle-bracket form', () => {
+    expect(fileRef('/tmp/u/my shot.png')).toBe('![my shot.png](</tmp/u/my shot.png>)');
+  });
+
+  it('leaves anything else as a plain file reference', () => {
+    expect(fileRef('/tmp/u/notes.txt')).toBe('[file: /tmp/u/notes.txt]');
+    expect(fileRef('/tmp/u/a.svg')).toBe('[file: /tmp/u/a.svg]');
   });
 });
 

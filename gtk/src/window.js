@@ -26,6 +26,16 @@ Gio._promisify(Gtk.FileDialog.prototype, 'open', 'open_finish');
 // One page of transcript history, matching the web client's window size.
 const TRANSCRIPT_PAGE = 100;
 
+// What an upload drops into the message box. An image goes in as markdown so
+// the transcript renders it inline; the extensions are the ones /image will
+// serve. A path with a space needs the <...> destination form.
+export function fileRef(path) {
+  if (!/\.(?:png|jpe?g|gif|webp)$/i.test(path)) return `[file: ${path}]`;
+  const alt = path.split('/').pop().replace(/[[\]]/g, '');
+  const dest = /\s/.test(path) ? `<${path}>` : path;
+  return `![${alt}](${dest})`;
+}
+
 // A session whose worker is attached and can be paused.
 const isBusy = session => session.status === 'live' || session.status === 'running' ||
   session.status === 'awaiting_permission';
@@ -1453,7 +1463,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       const buffer = this._prompt.get_buffer();
       const current = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), false);
       const prefix = current && !current.endsWith('\n') ? '\n' : '';
-      buffer.set_text(`${current}${prefix}[file: ${result.path}] `, -1);
+      buffer.set_text(`${current}${prefix}${fileRef(result.path)} `, -1);
       this._prompt.grab_focus();
       this._showToast(`Uploaded ${filename}`);
     } catch (error) {

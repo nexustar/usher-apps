@@ -402,11 +402,12 @@ export class Sidebar {
     const closeGroup = () => {
       if (group && archivedInGroup) {
         this._archivedCounts.set(group.key, archivedInGroup);
-        // Two rows: one that folds the group's archived sessions away, and —
-        // once open, while any are still held back — one that pages in the
-        // next batch. Rows rather than buttons inside a row, which is how the
+        // Two rows: one that pages in the next batch, and below it the one
+        // that folds the group away. "Show more" continues the archived rows
+        // above it, so it belongs with them; the collapse control terminates
+        // the group. Rows rather than buttons inside a row, which is how the
         // collapsible sections in GNOME's own sidebars are built.
-        for (const disclosure of ['toggle', 'more']) {
+        for (const disclosure of ['more', 'toggle']) {
           items.push(new SidebarItem({
             kind: 'disclosure',
             disclosure,

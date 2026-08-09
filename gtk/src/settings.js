@@ -111,6 +111,13 @@ function suggestionRow(title, value, suggestions, tooltip) {
 
 function multilineGroup(title, description, text) {
   const group = new Adw.PreferencesGroup({ title, description });
+  const field = multilineField(text);
+  group.add(field.widget);
+  return { group, get value() { return field.value; } };
+}
+
+// The editor on its own, for callers that place it in a group of their own.
+function multilineField(text) {
   const view = new Gtk.TextView({
     wrap_mode: Gtk.WrapMode.WORD_CHAR,
     top_margin: 8, bottom_margin: 8, left_margin: 8, right_margin: 8,
@@ -121,9 +128,8 @@ function multilineGroup(title, description, text) {
     propagate_natural_height: true,
   });
   scroll.add_css_class('card');
-  group.add(scroll);
   return {
-    group,
+    widget: scroll,
     get value() {
       const buffer = view.get_buffer();
       return buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), false).trim();
@@ -189,7 +195,15 @@ function nextRunText(task, timezone) {
 // when running a task starts a session.
 export async function showSettingsDialog(parent, context) {
   const { api, toast } = context;
-  const dialog = new Adw.PreferencesDialog({ title: 'Settings' });
+  // A dialog with no content size measures itself against whatever the first
+  // page happens to hold, so one agent leaves it too small for the form that
+  // editing that agent opens. Fractal's account settings pins a size for the
+  // same reason. AdwDialog still shrinks below this on a small screen.
+  const dialog = new Adw.PreferencesDialog({
+    title: 'Settings',
+    content_width: 520,
+    content_height: 640,
+  });
 
   const state = { catalog: null, agents: [], schedules: [], timezone: '' };
   const cwdSuggestions = (context.recentCwds || []).map(cwd => [cwd, cwd]);
@@ -300,22 +314,40 @@ export async function showSettingsDialog(parent, context) {
     runtime.add(approveRow);
     prefs.add(runtime);
 
-    const prompt = multilineGroup(
-      'Append system prompt',
-      'Additional instructions for sessions created with this agent.',
-      agent?.append_system_prompt
-    );
-    prefs.add(prompt.group);
-
-    const advanced = new Adw.PreferencesGroup({ title: 'Advanced' });
+    // Both of these are the web form's Advanced section: rarely touched, and
+    // easy to break a spawn with. It collapses like the web's <details>, and
+    // starts open only when one of them already holds something.
+    const advancedGroup = new Adw.PreferencesGroup();
+    const advanced = new Adw.ExpanderRow({ title: 'Advanced' });
+    advancedGroup.add(advanced);
     const extraArgs = new Adw.EntryRow({ title: 'Extra CLI flags' });
     extraArgs.add_css_class('monospace');
     extraArgs.set_text((agent?.extra_args || []).join(' '));
     // usher appends these to the backend's own spawn flags.
     extraArgs.set_tooltip_text(
       'Space-separated flags added when spawning this agent\'s backend');
-    advanced.add(extraArgs);
-    prefs.add(advanced);
+    advanced.add_row(extraArgs);
+    const prompt = multilineField(agent?.append_system_prompt);
+    const promptBox = new Gtk.Box({
+      orientation: Gtk.Orientation.VERTICAL,
+      spacing: 4,
+      margin_top: 8, margin_bottom: 8, margin_start: 12, margin_end: 12,
+    });
+    const promptLabel = new Gtk.Label({ label: 'Append system prompt', xalign: 0 });
+    promptLabel.add_css_class('heading');
+    promptBox.append(promptLabel);
+    const promptHint = new Gtk.Label({
+      label: 'Additional instructions for sessions created with this agent.',
+      xalign: 0, wrap: true,
+    });
+    promptHint.add_css_class('caption');
+    promptHint.add_css_class('dim-label');
+    promptBox.append(promptHint);
+    promptBox.append(prompt.widget);
+    advanced.add_row(promptBox);
+    advanced.set_expanded(
+      Boolean(agent?.append_system_prompt) || (agent?.extra_args || []).length > 0);
+    prefs.add(advancedGroup);
 
     const collect = () => {
       const flags = extraArgs.get_text().trim();
