@@ -74,9 +74,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._backend.configure(this._currentServer || {});
     this._api = new ApiClient(backend.baseUrl);
     this._selectedId = null;
-    this._transcriptLimit = TRANSCRIPT_PAGE;
-    this._windowStart = 0;
-    this._transcriptTotal = 0;
+    this._hasEarlier = false;
     this._loadingEarlier = false;
     this._eventStream = null;
     this._started = false;
@@ -1165,9 +1163,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._sendInFlight = false;
     this._transcriptStore.remove_all();
     this._setTurnRunning(false);
-    this._transcriptLimit = TRANSCRIPT_PAGE;
-    this._windowStart = 0;
-    this._transcriptTotal = 0;
+    this._hasEarlier = false;
     this._loadingEarlier = false;
     // Blank, not a status page: opening a session is quick enough that a
     // "Loading…" screen only registers as a flash. A failure replaces this
@@ -1476,20 +1472,36 @@ class UsherWindow extends Adw.ApplicationWindow {
     }
   }
 
+  // Catches up from the last turn that has a cursor, or reads the newest page
+  // when there is none or the server no longer knows it.
   async _loadTranscript(id, epoch = this._selectionEpoch) {
+    const stale = () => this._selectionEpoch !== epoch || this._selectedId !== id;
     const initialLoad = this._renderedTurns.length === 0;
-    const { turns, total, offset } = await this._api.getTranscript(
-      id, { limit: this._transcriptLimit });
-    if (this._selectionEpoch !== epoch || this._selectedId !== id) return false;
-    const incoming = (turns || []).map(turn => ({ key: this._turnKey(turn), turn }));
+    // A turn the event stream delivered has no cursor until a refresh.
+    const held = this._renderedTurns.findLast(entry => entry.turn.cursor)?.turn.cursor;
+    let page = null;
+    if (held) {
+      page = await this._api.getTranscript(id, { from: held });
+      if (stale()) return false;
+    }
+    let base = page?.turns.length
+      ? this._renderedTurns.findIndex(entry => entry.turn.cursor === held) : -1;
+    if (base < 0) {
+      page = await this._api.getTranscript(id, { limit: TRANSCRIPT_PAGE });
+      if (stale()) return false;
+      base = 0;
+      this._hasEarlier = page.more;
+    }
+    const incoming = page.turns.map(turn => ({ key: this._turnKey(turn), turn }));
     let common = 0;
-    while (common < incoming.length && common < this._renderedTurns.length &&
-           incoming[common].key === this._renderedTurns[common].key) {
+    while (common < incoming.length && base + common < this._renderedTurns.length &&
+           incoming[common].key === this._renderedTurns[base + common].key) {
+      this._renderedTurns[base + common].turn = incoming[common].turn;
       common++;
     }
     // Everything past the common prefix goes, which is also how the live turn
     // and the optimistic echo are reconciled away.
-    this._renderedTurns.length = common;
+    this._renderedTurns.length = base + common;
     this._optimisticTurn = null;
     this._liveTurn = null;
     // One splice rather than a remove and an append per turn: each of those
@@ -1497,41 +1509,32 @@ class UsherWindow extends Adw.ApplicationWindow {
     const added = incoming.slice(common)
       .map(entry => new TranscriptItem(entry.turn, entry.key));
     this._transcriptStore.splice(
-      common, this._transcriptStore.get_n_items() - common, added);
+      base + common, this._transcriptStore.get_n_items() - base - common, added);
     for (let i = common; i < incoming.length; i++) this._renderedTurns.push(incoming[i]);
     this._scrollToBottom(initialLoad);
-    this._transcriptTotal = total;
-    this._windowStart = offset;
-    // Offset 0 means the window already reaches the first turn.
-    this._loadEarlier.set_visible(offset > 0);
+    this._loadEarlier.set_visible(this._hasEarlier);
     return true;
   }
 
-  // Inserts one page of older turns above what is rendered. The limit must
-  // grow by exactly what was prepended: _loadTranscript aligns both lists from
-  // their first turn, so a shorter window next time would drop this page.
+  // Inserts the page of turns ahead of the oldest one rendered.
   async _loadEarlierMessages() {
     const id = this._selectedId;
     const epoch = this._selectionEpoch;
-    if (!id || this._loadingEarlier || this._windowStart <= 0) return;
+    const oldest = this._renderedTurns[0]?.turn.cursor;
+    if (!id || this._loadingEarlier || !this._hasEarlier || !oldest) return;
     this._loadingEarlier = true;
     this._loadEarlier.set_sensitive(false);
     try {
-      const { turns, offset } = await this._api.getTranscript(
-        id, { limit: TRANSCRIPT_PAGE, before: this._windowStart });
+      const { turns, more } = await this._api.getTranscript(
+        id, { limit: TRANSCRIPT_PAGE, before: oldest });
       if (this._selectionEpoch !== epoch || this._selectedId !== id) return;
-      if (!turns.length) {
-        this._windowStart = 0;
-        this._loadEarlier.set_visible(false);
-        return;
-      }
+      this._hasEarlier = more && turns.length > 0;
+      this._loadEarlier.set_visible(this._hasEarlier);
+      if (!turns.length) return;
       const entries = turns.map(turn => ({ key: this._turnKey(turn), turn }));
       this._transcriptStore.splice(
         0, 0, entries.map(e => new TranscriptItem(e.turn, e.key)));
       this._renderedTurns.unshift(...entries);
-      this._windowStart = offset;
-      this._transcriptLimit += turns.length;
-      this._loadEarlier.set_visible(offset > 0);
       // Put the turn that was at the top back at the top, so the inserted
       // history does not yank the reader.
       this._messages.scroll_to(entries.length, Gtk.ListScrollFlags.NONE, null);

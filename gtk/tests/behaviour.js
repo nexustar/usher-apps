@@ -252,39 +252,45 @@ describe('the app against a live usher', () => {
     expect(keys.includes('__optimistic__')).toBeFalsy();
   });
 
-  it('reports the transcript window position', async () => {
-    const target = sessions.find(async s => (await api.getTranscript(s.id, { limit: 1 })).total > 4)
-      || sessions[0];
-    const newest = await api.getTranscript(target.id, { limit: 3 });
-    expect(newest.offset).toBe(Math.max(0, newest.total - newest.turns.length));
-    if (newest.offset > 0) {
-      const older = await api.getTranscript(target.id, { limit: 3, before: newest.offset });
-      expect(older.offset).toBe(Math.max(0, newest.offset - older.turns.length));
+  it('pages and catches up by turn cursor', async () => {
+    let newest = null;
+    let target = null;
+    for (const s of sessions) {
+      newest = await api.getTranscript(s.id, { limit: 3 });
+      if (newest.more) { target = s; break; }
     }
+    if (!target) return; // nothing long enough on this server
+    expect(newest.turns).toHaveLength(3);
+    expect(newest.turns.every(turn => turn.cursor)).toBeTruthy();
+    const older = await api.getTranscript(target.id, { limit: 3, before: newest.turns[0].cursor });
+    expect(older.turns.length > 0).toBeTruthy();
+    expect(older.turns.at(-1).cursor === newest.turns[0].cursor).toBeFalsy();
+    const caught = await api.getTranscript(target.id, { from: newest.turns[1].cursor });
+    expect(caught.turns.map(turn => turn.cursor))
+      .toEqual(newest.turns.slice(1).map(turn => turn.cursor));
   });
 
   it('pages older turns in without losing them on the next refresh', async () => {
-    let target = null;
-    for (const s of sessions) {
-      const { total } = await api.getTranscript(s.id, { limit: 1 });
-      if (total > 6) { target = { id: s.id, total }; break; }
-    }
-    if (!target) return; // nothing long enough on this server
-    await win._selectSession(target.id);
-    win._transcriptLimit = 3;
-    await win._loadTranscript(target.id);
-    expect(win._renderedTurns).toHaveLength(3);
-    expect(win._windowStart).toBe(target.total - 3);
-
+    // Three turns a page, so any session with more than that can page.
     const real = api.getTranscript.bind(api);
-    api.getTranscript = (id, opts = {}) =>
-      real(id, (opts.before ?? -1) >= 0 ? { ...opts, limit: 3 } : opts);
+    api.getTranscript = (id, opts = {}) => real(id, opts.from ? opts : { ...opts, limit: 3 });
     try {
+      let target = null;
+      for (const s of sessions) {
+        if ((await api.getTranscript(s.id)).more) { target = s; break; }
+      }
+      if (!target) return; // nothing long enough on this server
+      await win._selectSession(target.id);
+      expect(win._renderedTurns).toHaveLength(3);
+      expect(win._hasEarlier).toBeTruthy();
+      const newest = win._renderedTurns.map(entry => entry.key);
+
       await win._loadEarlierMessages();
       expect(win._renderedTurns).toHaveLength(6);
-      expect(win._transcriptLimit).toBe(6);
+      expect(win._renderedTurns.slice(3).map(entry => entry.key)).toEqual(newest);
       await win._loadTranscript(target.id);
       expect(win._renderedTurns).toHaveLength(6);
+      expect(win._transcriptStore.get_n_items()).toBe(6);
     } finally {
       api.getTranscript = real;
     }

@@ -141,12 +141,13 @@ export class ApiClient {
     return this.request('GET', `/api/sessions/${encodeURIComponent(id)}`);
   }
 
-  // A window of a session's turns. `before` is the exclusive upper bound in
-  // absolute turn indices (negative asks for the newest); the returned offset
-  // is the window's first index, so 0 means all history is loaded. The counts
-  // ride in headers, which the generic path discards.
-  async getTranscript(id, { limit = 100, before = -1 } = {}) {
-    const query = `?limit=${limit}` + (before >= 0 ? `&before=${before}` : '');
+  // A page of a session's turns, oldest first: the newest `limit`, the page
+  // ahead of cursor `before`, or the turn at cursor `from` and everything after
+  // it. `more` says older turns exist ahead of the first one.
+  async getTranscript(id, { limit = 100, before = '', from = '' } = {}) {
+    const query = from
+      ? `?from=${encodeURIComponent(from)}`
+      : `?limit=${limit}` + (before ? `&before=${encodeURIComponent(before)}` : '');
     const message = Soup.Message.new(
       'GET',
       `${this.baseUrl}/api/sessions/${encodeURIComponent(id)}/transcript${query}`
@@ -162,16 +163,7 @@ export class ApiClient {
       const detail = payload?.error || `HTTP ${message.status_code}`;
       throw new ApiError(message.status_code, detail);
     }
-    const headers = message.get_response_headers();
-    const turns = payload || [];
-    const total = parseInt(headers.get_one('X-Transcript-Total') || '', 10);
-    const offset = parseInt(headers.get_one('X-Transcript-Offset') || '', 10);
-    const count = Number.isFinite(total) ? total : turns.length;
-    return {
-      turns,
-      total: count,
-      offset: Number.isFinite(offset) ? offset : Math.max(0, count - turns.length),
-    };
+    return { turns: payload?.turns || [], more: Boolean(payload?.more) };
   }
 
   fork(id, afterUUID) {
