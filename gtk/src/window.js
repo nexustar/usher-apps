@@ -2130,7 +2130,7 @@ class UsherWindow extends Adw.ApplicationWindow {
   }
 
   // A 'part' SSE event wraps the server-rendered TurnPart:
-  // { role, ts, model, part: {type, content, toolName, toolTarget} }.
+  // { role, ts, model, part: {type, content, content_kind, tool_name, tool_target} }.
   _appendLivePart(data) {
     const part = data?.part;
     if (!part) return;

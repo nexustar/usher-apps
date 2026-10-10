@@ -38,8 +38,8 @@ if (actions.get_n_items() < 2) {
   throw new Error('session action menu was not constructed');
 }
 const toolWidget = window._transcript.toolWidget({
-  type: 'tool', toolName: 'Read', toolTarget: '/tmp/example.js',
-  content: '```js\nconst answer = 42;\n```',
+  type: 'tool', tool_name: 'Read', tool_target: '/tmp/example.js',
+  content: 'const answer = 42;',
 });
 if (!toolWidget.has_css_class('tool-card')) throw new Error('tool card style was not applied');
 const archived = sessions.find(session => session.archived);

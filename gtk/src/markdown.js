@@ -69,8 +69,11 @@ function labelFor(token, extra = {}) {
 // renders a plain <pre>). Diff fences are the one exception the web makes —
 // it colours +/-/@@ lines, so this does too.
 function codeBlock(token) {
-  const text = String(token.text || '').trim();
-  const isDiff = /^diff\b/.test(String(token.lang || '').trim());
+  return codeWidget(String(token.text || '').trim(),
+    /^diff\b/.test(String(token.lang || '').trim()));
+}
+
+export function codeWidget(text, isDiff = false) {
   const label = new Gtk.Label({
     xalign: 0,
     yalign: 0,

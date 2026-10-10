@@ -190,26 +190,36 @@ export class TranscriptView {
   toolWidget(part) {
     // show_image exists to put a picture in the transcript, so it renders as
     // one instead of a collapsible tool call.
-    if (part.toolTarget && /(^|__)show_image$/.test(part.toolName || '')) {
-      const picture = this.imageWidget(part.toolTarget, this.imageDims(part.content));
+    if (part.tool_target && /(^|__)show_image$/.test(part.tool_name || '')) {
+      const picture = this.imageWidget(part.tool_target, this.imageDims(part.content));
       if (picture) return picture;
     }
     const expander = new Gtk.Expander();
     expander.set_label_widget(this.toolHeader(part));
     expander.connect('notify::expanded', () => {
       if (!expander.get_expanded() || expander.get_child()) return;
-      const body = markdown.render(part.content || '');
+      const body = this.toolBody(part);
       body.add_css_class('tool-body');
       expander.set_child(body);
     });
     const frame = new Gtk.Frame({ child: expander, hexpand: true });
     frame.add_css_class('tool-card');
-    if (/^(Edit|Write)$/i.test(part.toolName || '')) expander.set_expanded(true);
+    if (/^(Edit|Write)$/i.test(part.tool_name || '')) expander.set_expanded(true);
     return frame;
   }
 
+  // Tool output is data: never laid out as markdown.
+  toolBody(part) {
+    if (part.content_kind === 'image') {
+      return this.imageWidget(part.tool_target) || new Gtk.Box();
+    }
+    const text = String(part.content || '').replace(/\n+$/, '');
+    if (!text) return new Gtk.Box();
+    return markdown.codeWidget(text, part.content_kind === 'diff');
+  }
+
   toolHeader(part) {
-    const full = `${part.toolName || 'Tool'}  ${part.toolTarget || ''}`.trim();
+    const full = `${part.tool_name || 'Tool'}  ${part.tool_target || ''}`.trim();
     const label = new Gtk.Label({
       label: ellipsize(full, 160),
       tooltip_text: full,
