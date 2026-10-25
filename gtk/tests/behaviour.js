@@ -655,6 +655,14 @@ describe('the app against a live usher', () => {
     expect(win._notificationStream._url).toContain('/api/v1/events?types=turn.ended,interaction.pending');
   });
 
+  it('reopens the session that was open last on this server', async () => {
+    await win._selectSession(sessions[1].id);
+    win._clearSessionSelection();
+    win._rememberSession(sessions[1].id);
+    win._restoreLastSession();
+    await until('the last session to reopen', () => win._selectedId === sessions[1].id);
+  });
+
   it('matches every search word and opens the first match on Enter', async () => {
     const target = sessions[1];
     const words = (target.title || '').split(/\s+/).filter(w => w.length > 1).slice(0, 2);

@@ -798,6 +798,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       const sessions = await this._api.listSessions();
       this._renderSessions(sessions || []);
       this._loadServerConfig();
+      this._restoreLastSession();
       this._startNotifications();
     } catch (error) {
       this._showError('Could not connect to usher', error);
@@ -1182,6 +1183,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._sidebar.unselectAll();
     this._showEmptyState();
     this._syncRouterEntry();
+    this._rememberSession('');
     if (this._splitView.get_collapsed()) this._splitView.set_show_sidebar(true);
   }
 
@@ -1571,6 +1573,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._currentSession = session;
       this._setSessionTitle(session);
       this._syncRouterEntry();
+      this._rememberSession(id);
       this._syncApproval();
       this._runtimeKey = null;
       this._renderRuntime(session.runtime);
@@ -2714,6 +2717,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._showEmptyState();
       this._title.set_subtitle(serverConfig.name || this._backend.baseUrl);
       this._loadServerConfig();
+      this._restoreLastSession();
       this._startNotifications();
       return true;
     } catch (error) {
@@ -2935,6 +2939,18 @@ class UsherWindow extends Adw.ApplicationWindow {
     }
     const adjustment = this._chatScroll.get_vadjustment();
     adjustment.set_value(Math.max(0, adjustment.get_upper() - adjustment.get_page_size()));
+  }
+
+  // The session open last on each server comes back on the next start.
+  _rememberSession(id) {
+    setPref('lastSessions', { ...getPref('lastSessions', {}), [this._backend.baseUrl]: id });
+  }
+
+  _restoreLastSession() {
+    const id = getPref('lastSessions', {})[this._backend.baseUrl];
+    if (id && !this._selectedId && !this._newMode && this._sidebar.sessionsById.has(id)) {
+      this._openSession(id).catch(() => {});
+    }
   }
 
   // Nothing open: the title bar names the server rather than the last
