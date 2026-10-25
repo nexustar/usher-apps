@@ -240,6 +240,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     render.connect('activate', (action, parameter) => {
       const mode = parameter.get_string()[0];
       action.set_state(GLib.Variant.new_string(mode));
+      this._renderMode?.set_active_name(mode);
       this._rawMarkdown = mode === 'raw';
       this._rerenderTranscript();
     });
@@ -288,6 +289,12 @@ class UsherWindow extends Adw.ApplicationWindow {
       if (this._selectedId) this._sidebar.selectSession(this._selectedId);
     });
     this.add_action(groupBy);
+    add('new-session', () => this._showNewSession());
+    add('search', () => {
+      if (this._splitView.get_collapsed()) this._splitView.set_show_sidebar(true);
+      this._searchToggle.set_active(true);
+      this._search.grab_focus();
+    });
   }
 
   _showSettings(page = '') {
@@ -389,12 +396,23 @@ class UsherWindow extends Adw.ApplicationWindow {
       if (mode) this.activate_action('render-mode', GLib.Variant.new_string(mode));
     });
     header.pack_end(renderMode);
+    this._renderMode = renderMode;
+    this._refreshButton = refresh;
     contentToolbar.add_top_bar(header);
 
     const sidebarBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL });
     sidebarBox.set_size_request(300, -1);
     this._search = new Gtk.SearchEntry({ placeholder_text: 'Search sessions' });
     this._search.connect('search-changed', () => this._sidebar.refilter());
+    // Enter opens the first match; Down moves into the results.
+    this._search.connect('activate', () => {
+      const id = this._sidebar.firstMatch();
+      if (id) this._openSession(id).catch(() => {});
+    });
+    const searchKeys = new Gtk.EventControllerKey();
+    searchKeys.connect('key-pressed', (_controller, keyval) =>
+      keyval === Gdk.KEY_Down && this._sidebar.focusFirst());
+    this._search.add_controller(searchKeys);
     const searchBar = new Gtk.SearchBar({ child: this._search });
     searchBar.set_key_capture_widget(this);
     sidebarBox.append(searchBar);
@@ -411,6 +429,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE
     );
     sidebarHeader.pack_end(searchToggle);
+    this._searchToggle = searchToggle;
     this._sidebar.groupByDate = getPref('sidebarGroup', 'cwd') === 'date';
     // Primary menu: app-scoped destinations, per the HIG. Session-scoped
     // actions stay in the conversation header's own menu.
@@ -457,10 +476,18 @@ class UsherWindow extends Adw.ApplicationWindow {
       hexpand: true,
       vexpand: true,
     });
+    this._emptyAction = new Gtk.Button({
+      label: 'New Session',
+      halign: Gtk.Align.CENTER,
+      action_name: 'win.new-session',
+    });
+    this._emptyAction.add_css_class('pill');
+    this._emptyAction.add_css_class('suggested-action');
     this._status = new Adw.StatusPage({
       icon_name: 'utilities-terminal-symbolic',
       title: 'Select a session',
       description: 'Choose a conversation from the sidebar.',
+      child: this._emptyAction,
     });
     content.append(this._status);
 
@@ -544,7 +571,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     });
     this._newBar.append(this._newCwd);
     this._newCwdSuggestions = new Gtk.MenuButton({
-      icon_name: 'view-list-symbolic',
+      icon_name: 'document-open-recent-symbolic',
       tooltip_text: 'Recent working directories',
       valign: Gtk.Align.CENTER,
     });
@@ -655,7 +682,13 @@ class UsherWindow extends Adw.ApplicationWindow {
       // GJS hands out a Cairo context that has to be released by hand.
       cr.$dispose();
     });
-    this._usage.set_child(this._usageRing);
+    // The model beside the ring, as the web composer shows it when it has room.
+    this._usageLabel = new Gtk.Label({ visible: false, valign: Gtk.Align.CENTER });
+    this._usageLabel.add_css_class('caption');
+    const usageContent = new Gtk.Box({ spacing: 6 });
+    usageContent.append(this._usageRing);
+    usageContent.append(this._usageLabel);
+    this._usage.set_child(usageContent);
     this._usageDetail = new Gtk.Box({
       orientation: Gtk.Orientation.VERTICAL,
       spacing: 6,
@@ -727,6 +760,17 @@ class UsherWindow extends Adw.ApplicationWindow {
       condition: Adw.BreakpointCondition.parse('max-width: 700sp'),
     });
     breakpoint.add_setter(this._splitView, 'collapsed', true);
+    // Narrow, the title keeps the header: md/raw moves into the session menu,
+    // and refresh stays on Ctrl+R.
+    breakpoint.add_setter(this._renderMode, 'visible', false);
+    breakpoint.add_setter(this._refreshButton, 'visible', false);
+    const narrow = value => {
+      this._narrow = value;
+      this._syncSessionMenu();
+      this._syncUsageLabel();
+    };
+    breakpoint.connect('apply', () => narrow(true));
+    breakpoint.connect('unapply', () => narrow(false));
     this.add_breakpoint(breakpoint);
 
     this._toastOverlay = new Adw.ToastOverlay({ child: this._splitView });
@@ -885,13 +929,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._selectionEpoch++;
       this._selectedId = null;
       this._eventStream?.stop();
-      this._status.set_title('Select a session');
-      this._status.set_description('Choose a conversation from the sidebar.');
-      this._status.set_icon_name('utilities-terminal-symbolic');
-      this._status.set_visible(true);
-      this._chatScroll.set_visible(false);
-      this._loadEarlier.set_visible(false);
-      this._composer.set_visible(false);
+      this._showEmptyState();
     }
     this._syncSessionMenu();
     this._syncRouterEntry();
@@ -984,6 +1022,12 @@ class UsherWindow extends Adw.ApplicationWindow {
       router.append('New _Router Conversation', 'win.router-new');
       menu.append_section(null, router);
     }
+    if (this._narrow && !inSidebar) {
+      const render = new Gio.Menu();
+      render.append('Rendered _Markdown', 'win.render-mode::md');
+      render.append('Ra_w Text', 'win.render-mode::raw');
+      menu.append_section(null, render);
+    }
     const destructive = new Gio.Menu();
     destructive.append('_Delete Permanently…', 'win.session-delete');
     menu.append_section(null, destructive);
@@ -1074,13 +1118,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._transcriptStore.remove_all();
     this._liveTurn = null;
     this._sidebar.unselectAll();
-    this._status.set_title('Select a session');
-    this._status.set_description('Choose a conversation from the sidebar.');
-    this._status.set_visible(true);
-    this._chatScroll.set_visible(false);
-    this._loadEarlier.set_visible(false);
-    this._composer.set_visible(false);
-    this._status.set_icon_name('utilities-terminal-symbolic');
+    this._showEmptyState();
     this._syncRouterEntry();
     if (this._splitView.get_collapsed()) this._splitView.set_show_sidebar(true);
   }
@@ -1120,6 +1158,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       : 'Set a working directory, then write the first message.');
     this._status.set_icon_name(router
       ? 'io.github.nexustar.Usher-router-symbolic' : 'utilities-terminal-symbolic');
+    this._emptyAction.set_visible(false);
     this._status.set_visible(true);
     this._chatScroll.set_visible(false);
     this._loadEarlier.set_visible(false);
@@ -1691,6 +1730,8 @@ class UsherWindow extends Adw.ApplicationWindow {
     const current = this._catalogModel(models, runtime.model);
     const modelName = current?.display_name ||
       this._catalogModel(this._sessionModels(), runtime.model)?.display_name || runtime.model;
+    this._usageLabel.set_label([modelName, runtime.effort].filter(Boolean).join(' · '));
+    this._syncUsageLabel();
     this._usage.set_tooltip_text(
       [[modelName, runtime.effort].filter(Boolean).join(', '),
         measured ? `Context ${percent}% used` : 'Context usage unavailable']
@@ -1747,6 +1788,14 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._usageDetail.append(bar);
     }
     for (const [name, text] of activityRows) addRow(name, text);
+  }
+
+  // A circle around the ring alone; a pill once the label shows.
+  _syncUsageLabel() {
+    const shown = !this._narrow && Boolean(this._usageLabel.get_label());
+    this._usageLabel.set_visible(shown);
+    if (shown) this._usage.remove_css_class('circular');
+    else this._usage.add_css_class('circular');
   }
 
   // An id outside the choices shows as is.
@@ -2596,12 +2645,8 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._renderSessions(sessions || []);
       this._interactionKey = null;
       this._updateInteractions([]);
-      this._status.set_title('Select a session');
-      this._status.set_description('Choose a conversation from the sidebar.');
-      this._status.set_visible(true);
-      this._chatScroll.set_visible(false);
-      this._composer.set_visible(false);
       this._started = true;
+      this._showEmptyState();
       this._title.set_subtitle(serverConfig.name || this._backend.baseUrl);
       this._loadServerConfig();
       return true;
@@ -2824,7 +2869,25 @@ class UsherWindow extends Adw.ApplicationWindow {
     adjustment.set_value(Math.max(0, adjustment.get_upper() - adjustment.get_page_size()));
   }
 
+  // Nothing open: the title bar names the server rather than the last
+  // session.
+  _showEmptyState() {
+    this._currentSession = null;
+    this._title.set_title('usher');
+    this._title.set_subtitle(this._started ? this._backend.baseUrl : '');
+    this._usage.set_visible(false);
+    this._status.set_icon_name('utilities-terminal-symbolic');
+    this._status.set_title('Select a session');
+    this._status.set_description('Choose a conversation from the sidebar.');
+    this._emptyAction.set_visible(true);
+    this._status.set_visible(true);
+    this._chatScroll.set_visible(false);
+    this._loadEarlier.set_visible(false);
+    this._composer.set_visible(false);
+  }
+
   _showError(title, error) {
+    this._emptyAction.set_visible(false);
     this._status.set_title(title);
     this._status.set_description(error.message || String(error));
     this._status.set_visible(true);

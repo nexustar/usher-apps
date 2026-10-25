@@ -377,6 +377,9 @@ describe('the app against a live usher', () => {
     expect(win._usage.get_visible()).toBeTruthy();
     expect(win._usageFraction).toBe(0.21);
     expect(win._usage.get_tooltip_text()).toBe('sonnet, high · Context 21% used');
+    expect(win._usageLabel.get_label()).toBe('sonnet · high');
+    expect(win._usageLabel.get_visible()).toBeTruthy();
+    expect(win._usage.has_css_class('circular')).toBeFalsy();
     expect(labels(win._usageDetail)).toContain('sonnet');
     win._renderRuntime({ context_tokens: 0 });
     expect(win._usage.get_visible()).toBeFalsy();
@@ -546,6 +549,31 @@ describe('the app against a live usher', () => {
     expect(win._sidebar.groupByDate).toBeFalsy();
   });
 
+  it('names the server, not the last session, when nothing is open', async () => {
+    await win._selectSession(sessions[0].id);
+    win._clearSessionSelection();
+    expect(win._title.get_title()).toBe('usher');
+    expect(win._emptyAction.get_visible()).toBeTruthy();
+    await win._showNewSession();
+    expect(win._emptyAction.get_visible()).toBeFalsy();
+    await win._selectSession(sessions[0].id);
+  });
+
+  it('moves md/raw into the session menu when narrow', async () => {
+    await win._selectSession(sessions[0].id);
+    win._narrow = true;
+    try {
+      const labels = menuLabels(win._sessionMenuModel(win._currentSession));
+      expect(labels).toContain('Ra_w Text');
+      win.activate_action('render-mode', GLib.Variant.new_string('raw'));
+      expect(win._renderMode.get_active_name()).toBe('raw');
+      win.activate_action('render-mode', GLib.Variant.new_string('md'));
+    } finally {
+      win._narrow = false;
+    }
+    expect(menuLabels(win._sessionMenuModel(win._currentSession)).includes('Ra_w Text')).toBeFalsy();
+  });
+
   it('groups the sidebar by date, naming each row\'s directory', () => {
     try {
       win._sidebar.setGroupByDate(true);
@@ -588,6 +616,24 @@ describe('the app against a live usher', () => {
     expect(descend(streaming).some(w => w instanceof Gtk.Picture)).toBeFalsy();
     const broken = markdown.render('```mermaid\nnot a diagram at all\n```\n');
     expect(descend(broken).some(w => w instanceof Gtk.Picture)).toBeFalsy();
+  });
+
+  it('matches every search word and opens the first match on Enter', async () => {
+    const target = sessions[1];
+    const words = (target.title || '').split(/\s+/).filter(w => w.length > 1).slice(0, 2);
+    if (!words.length) return;
+    try {
+      win._search.set_text(words.join(' ').toLowerCase());
+      await until('the filter', () => win._sidebar.firstMatch() !== null);
+      win._search.set_text(`${words[0].toLowerCase()} zzzz-no-such-word`);
+      await until('no match', () => win._sidebar.firstMatch() === null);
+      win._search.set_text(target.title.toLowerCase());
+      await until('the target first', () => win._sidebar.firstMatch() === target.id);
+      win._search.emit('activate');
+      await until('the session to open', () => win._selectedId === target.id);
+    } finally {
+      win._search.set_text('');
+    }
   });
 
   it('lists Details among the session actions', () => {

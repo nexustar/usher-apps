@@ -81,7 +81,7 @@ function choiceRow(title, values, current, placeholder = 'Default') {
 // A text row with a menu of suggestions on its trailing edge — the row-native
 // stand-in for the web's <datalist>, used for recent working directories and
 // cron presets.
-function suggestionRow(title, value, suggestions, tooltip) {
+function suggestionRow(title, value, suggestions, tooltip, icon = 'view-list-symbolic') {
   const row = new Adw.EntryRow({ title });
   row.set_text(value || '');
   if (!suggestions.length) return { row, get value() { return row.get_text().trim(); } };
@@ -92,7 +92,7 @@ function suggestionRow(title, value, suggestions, tooltip) {
     hscrollbar_policy: Gtk.PolicyType.NEVER,
   }) });
   const button = new Gtk.MenuButton({
-    icon_name: 'view-list-symbolic',
+    icon_name: icon,
     valign: Gtk.Align.CENTER,
     tooltip_text: tooltip,
     popover,
@@ -356,7 +356,8 @@ export async function showSettingsDialog(parent, context) {
       identity.set_description('Used when a new session asks for nothing else.');
     }
     const cwdInput = suggestionRow(
-      'Working directory', agent?.cwd, cwdSuggestions, 'Recent working directories'
+      'Working directory', agent?.cwd, cwdSuggestions, 'Recent working directories',
+      'document-open-recent-symbolic'
     );
     identity.add(cwdInput.row);
     prefs.add(identity);
@@ -579,7 +580,8 @@ export async function showSettingsDialog(parent, context) {
     );
     target.add(agentInput.row);
     const cwdInput = suggestionRow(
-      'Working directory', task?.cwd, cwdSuggestions, 'Recent working directories'
+      'Working directory', task?.cwd, cwdSuggestions, 'Recent working directories',
+      'document-open-recent-symbolic'
     );
     target.add(cwdInput.row);
     const pickers = backendModelRows(

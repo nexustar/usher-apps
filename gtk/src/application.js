@@ -42,6 +42,8 @@ class UsherApplication extends Adw.Application {
     this.set_accels_for_action('app.refresh', ['<Primary>r']);
     // The shortcut users try first for a settings dialog.
     this.set_accels_for_action('win.settings', ['<Primary>comma']);
+    this.set_accels_for_action('win.new-session', ['<Primary>n']);
+    this.set_accels_for_action('win.search', ['<Primary>f']);
   }
 
   async vfunc_activate() {

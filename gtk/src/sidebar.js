@@ -350,6 +350,21 @@ export class Sidebar {
     return '';
   }
 
+  // The first session the filter shows, for opening from the search entry.
+  firstMatch() {
+    for (let i = 0; i < this._filtered.get_n_items(); i++) {
+      const item = this._filtered.get_item(i);
+      if (item.kind !== 'disclosure') return item.session.id;
+    }
+    return null;
+  }
+
+  focusFirst() {
+    if (!this._filtered.get_n_items()) return false;
+    this.listView.scroll_to(0, Gtk.ListScrollFlags.FOCUS | Gtk.ListScrollFlags.SELECT, null);
+    return true;
+  }
+
   selectSession(id) {
     for (let i = 0; i < this._filtered.get_n_items(); i++) {
       const item = this._filtered.get_item(i);
@@ -587,7 +602,7 @@ export class Sidebar {
     if (item.kind === 'subagent' && !this.expandedSubagents.has(item.subagentOf)) {
       return false;
     }
-    if (query) return Boolean(item.searchText?.includes(query));
+    if (query) return query.split(/\s+/).every(word => item.searchText?.includes(word));
     if (!item.archived) return true;
     return this.expandedArchived.has(item.groupKey) &&
       item.archivedIndex < this.archivedVisible(item.groupKey);
