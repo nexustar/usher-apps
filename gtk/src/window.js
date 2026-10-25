@@ -570,7 +570,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     const promptFrame = new Gtk.Frame({ hexpand: true, child: promptScroll });
     promptFrame.add_css_class('composer-frame');
     this._promptPlaceholder = new Gtk.Label({
-      label: 'Write a message — Ctrl+Enter to send',
+      label: 'Write a message — Shift+Enter for a new line',
       xalign: 0,
       halign: Gtk.Align.START,
       valign: Gtk.Align.START,
@@ -684,11 +684,14 @@ class UsherWindow extends Adw.ApplicationWindow {
     composer.append(composerBar);
     const promptKeys = new Gtk.EventControllerKey();
     promptKeys.connect('key-pressed', (_controller, keyval, _keycode, state) => {
-      if (keyval === Gdk.KEY_Return && (state & Gdk.ModifierType.CONTROL_MASK)) {
+      if (this._handleCommandKey(keyval)) return true;
+      // Enter sends, as in the web composer; Shift+Enter starts a new line.
+      if ((keyval === Gdk.KEY_Return || keyval === Gdk.KEY_KP_Enter) &&
+          !(state & Gdk.ModifierType.SHIFT_MASK)) {
         this._sendMessage();
         return true;
       }
-      return this._handleCommandKey(keyval);
+      return false;
     });
     this._prompt.add_controller(promptKeys);
     this._watchDraft();
@@ -2229,7 +2232,7 @@ class UsherWindow extends Adw.ApplicationWindow {
   }
 
   async _sendMessage() {
-    // The in-flight guard matters for Ctrl+Enter, which bypasses the
+    // The in-flight guard matters for Enter, which bypasses the
     // desensitized send button.
     if (this._sendInFlight) return;
     if (this._newMode) {

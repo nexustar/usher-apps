@@ -42,7 +42,7 @@ A native GTK 4/libadwaita client written in GJS. The current MVP provides:
 Building and running the app needs no npm and no JavaScript build step. npm is
 used only for the linter (`npm install && npm run lint`).
 
-`Ctrl+Enter` sends a message. While a turn is running, the send action is
+`Enter` sends a message and `Shift+Enter` starts a new line. While a turn is running, the send action is
 replaced by a stop action that interrupts the current turn.
 
 ## Build and run
