@@ -7,16 +7,19 @@ A native GTK 4/libadwaita client written in GJS. The current MVP provides:
 - session discovery, filtering, and metadata, kept fresh by a background poll;
 - a settings dialog (`Ctrl+,`) for the connected server's agent profiles and
   scheduled tasks;
-- backend, model, and agent selection when creating a session, including
-  attaching a file before the session exists;
-- backend slash-command completion in the composer, and context usage in the
-  conversation header;
+- backend, model, effort, approval and agent selection when creating a
+  session (starting from the server's default agent), including attaching a
+  file before the session exists;
+- backend slash-command completion in the composer, and context usage beside
+  send, whose popover also switches the session's model and effort;
+- a per-session approval menu (ask / auto / full, as the backend offers) and
+  a Details dialog that edits the session's extra CLI flags;
 - native transcript rendering, including collapsible tool calls and inline
   images (click one to open it full size);
 - responsive libadwaita navigation that collapses the session sidebar on narrow windows;
 - message sending and SSE-driven live refresh, including streamed text previews;
-- tool permission requests and AskUserQuestion prompts answered inline above
-  the composer;
+- tool permission requests (with the server's preview of the call), plan
+  approvals and agent questions answered inline above the composer;
 - connection to an externally managed usher instance for development.
 - local or remote server selection, including password authentication.
 
@@ -26,7 +29,6 @@ A native GTK 4/libadwaita client written in GJS. The current MVP provides:
 - GTK 4
 - libadwaita 1
 - libsoup 3
-- GtkSourceView 5
 - libsecret (optional: remembers server passwords)
 - Meson and Ninja (build only)
 

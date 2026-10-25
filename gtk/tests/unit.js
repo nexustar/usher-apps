@@ -4,7 +4,7 @@ import GLib from 'gi://GLib';
 
 import { describe, it, expect, run } from './harness.js';
 import { fileRef } from '../src/window.js';
-import { ellipsize } from '../src/text.js';
+import { ellipsize, formatArgs, parseArgs } from '../src/text.js';
 
 GLib.setenv('XDG_CONFIG_HOME', GLib.dir_make_tmp('usher-unit-XXXXXX'), true);
 const { DEFAULT_EMBEDDED_PORT, ServerStore } = await import('../src/server-store.js');
@@ -21,6 +21,23 @@ describe('ellipsize', () => {
 
   it('survives a missing value', () => {
     expect(ellipsize(null, 5)).toBe('');
+  });
+});
+
+describe('CLI flags as one line', () => {
+  it('round-trips empty arguments and ones with spaces', () => {
+    const args = ['--tools', '', '--name', 'two words', "it's"];
+    expect(parseArgs(formatArgs(args))).toEqual(args);
+  });
+
+  it('quotes only what needs it', () => {
+    expect(formatArgs(['--model', 'opus', ''])).toBe("--model opus ''");
+  });
+
+  it('refuses an unclosed quote', () => {
+    let error = null;
+    try { parseArgs('--x "open'); } catch (e) { error = e; }
+    expect(error?.message).toBe('Unclosed " in flags');
   });
 });
 

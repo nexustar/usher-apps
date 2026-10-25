@@ -14,8 +14,10 @@ import { DEFAULT_EMBEDDED_PORT, ServerStore } from './server-store.js';
 import { InteractionCards } from './interaction.js';
 import { Sidebar } from './sidebar.js';
 import { BACKENDS } from './style.js';
+import { APPROVALS } from './approvals.js';
 import { clearPassword, lookupPassword, storePassword } from './keyring.js';
 import { showSettingsDialog } from './settings.js';
+import { showSessionDetails } from './details.js';
 import { ellipsize } from './text.js';
 import { TranscriptView } from './transcript.js';
 
@@ -97,7 +99,9 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._newAgent = '';
     this._newBackend = '';
     this._newModel = '';
-    this._modelCatalog = null;
+    this._backendCatalog = null;
+    this._runtime = {};
+    this._runtimeKey = null;
     this._agentProfiles = [];
     this._drafts = new Map();
     this._unread = new Set();
@@ -159,6 +163,11 @@ class UsherWindow extends Adw.ApplicationWindow {
     });
     // toggleSubagents re-runs the filter itself; the rows already exist.
     onSession('session-subagents', session => this._sidebar.toggleSubagents(session.id));
+    onSession('session-details', session => showSessionDetails(this, session.id, {
+      api: this._api,
+      toast: message => this._showToast(message),
+      onSaved: () => this.refreshSessions(),
+    }).catch(error => this._showToast(error.message || String(error))));
     onSession('session-rename', session => this._showRenameDialog(session));
     onSession('session-pin', session => this._runSessionAction(
       () => this._api.setPinned(session.id, !session.pinned),
@@ -207,14 +216,21 @@ class UsherWindow extends Adw.ApplicationWindow {
     choice('new-agent', value => this._applyNewAgent(value));
     choice('new-backend', value => {
       this._newBackend = value;
-      this._newModel = ''; // the previous model belongs to the previous backend
-      this._newAgent = '';
+      // The previous model and effort belong to the previous backend.
+      this._newModel = 'default';
+      this._newEffort = '';
       this._syncNewConfig();
     });
     choice('new-model', value => {
       this._newModel = value;
+      this._newEffort = this._keptNewEffort();
       this._syncNewConfig();
     });
+    choice('new-effort', value => {
+      this._newEffort = value;
+      this._syncNewConfig();
+    });
+    choice('approval', value => this._pickApproval(value));
   }
 
   _showSettings(page = '') {
@@ -498,14 +514,13 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._upload.add_css_class('flat');
     this._upload.connect('clicked', () => this._chooseUpload());
     composerBar.append(this._upload);
-    this._autoApprove = new Gtk.ToggleButton({
+    this._approval = new Gtk.MenuButton({
       label: 'Approve: ask',
-      tooltip_text: 'Ask before tool calls; enable to approve automatically',
+      tooltip_text: 'Who answers the agent’s approval requests',
     });
-    this._autoApprove.add_css_class('flat');
-    this._autoApprove.add_css_class('approve-toggle');
-    this._autoApprove.connect('toggled', () => this._toggleAutoApprove());
-    composerBar.append(this._autoApprove);
+    this._approval.add_css_class('flat');
+    this._approval.add_css_class('approve-toggle');
+    composerBar.append(this._approval);
     // Agent / backend / model for a session that does not exist yet.
     this._newConfig = new Gtk.MenuButton({
       visible: false,
@@ -799,7 +814,7 @@ class UsherWindow extends Adw.ApplicationWindow {
   // and on selection changes.
   _syncSessionMenu() {
     const session = this._selectedSession();
-    if (!session || session.is_subagent) {
+    if (!session || session.subagent) {
       this._sessionMenu.set_visible(false);
       this._sessionMenu.set_menu_model(null);
       return;
@@ -825,6 +840,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       menu.append_section(null, section);
     }
     const main = new Gio.Menu();
+    main.append('De_tails…', 'win.session-details');
     main.append('_Rename…', 'win.session-rename');
     main.append(session.pinned ? 'Un_pin' : '_Pin', 'win.session-pin');
     main.append(session.archived ? 'Restore from _Archive' : '_Archive', 'win.session-archive');
@@ -945,6 +961,8 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._newAgent = '';
     this._newBackend = '';
     this._newModel = '';
+    this._newEffort = '';
+    this._newApproval = '';
     this._currentSession = null;
 
     this._title.set_title('New session');
@@ -963,7 +981,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._newBar.set_visible(true);
     this._newConfig.set_visible(true);
     this._composer.set_visible(true);
-    this._syncAutoApprove();
+    this._syncNewConfig();
     this._syncComposerActions();
     if (this._splitView.get_collapsed()) this._splitView.set_show_sidebar(false);
     this._newCwdSuggestions.set_popover(this._cwdSuggestionPopover());
@@ -971,18 +989,18 @@ class UsherWindow extends Adw.ApplicationWindow {
 
     // The catalogs only decorate the picker; the view is usable (and the
     // request valid) with everything left at its default.
-    try {
-      const [catalog, agentList] = await Promise.all([
-        this._api.listModels(), this._api.listAgents(),
-      ]);
-      if (!this._newMode) return;
-      this._modelCatalog = catalog;
-      this._agentProfiles = agentList?.agents || [];
-    } catch (_) {
-      this._modelCatalog = null;
-      this._agentProfiles = [];
-    }
-    this._syncNewConfig();
+    this._backendCatalog = null; // a backend may have been enabled since
+    const [catalog, agentList] = await Promise.all([
+      this._loadBackendCatalog(),
+      this._api.listAgents().catch(() => null),
+    ]);
+    if (!this._newMode) return;
+    const all = agentList?.agents || [];
+    this._defaultAgent = all.find(a => a.name === 'default') || null;
+    // The default agent is offered once it says something Custom does not.
+    this._agentProfiles = all.filter(a => !a.builtin);
+    if (!catalog) this._showToast('Could not load the backends; usher’s defaults apply');
+    this._useNewDefaults();
   }
 
   _leaveNewSession() {
@@ -1028,12 +1046,20 @@ class UsherWindow extends Adw.ApplicationWindow {
   }
 
   // Rebuilds the composer's config menu and its summary label. Agents are
-  // top-level radio items (the common choice); backend and model are submenus,
-  // because the model list depends on the backend.
+  // top-level radio items (the common choice); backend, model and effort are
+  // submenus, because each list depends on the choice before it.
   _syncNewConfig() {
-    const backends = this._modelCatalog?.backends || [];
-    const backend = this._newBackend || backends[0] || '';
-    const models = this._modelCatalog?.models?.[backend] || [];
+    const catalog = this._backendCatalog;
+    const backend = this._newBackend;
+    const backends = [...(catalog?.backends || [])];
+    if (backend && !backends.includes(backend)) backends.push(backend);
+    const models = [{ id: 'default', display_name: 'Default' },
+      ...(catalog?.models?.[backend] || [])];
+    if (this._newModel && !models.some(m => m.id === this._newModel)) {
+      models.push({ id: this._newModel, display_name: `${this._newModel} (unavailable)` });
+    }
+    const levels = this._catalogModel(catalog?.models?.[backend], this._newModel)
+      ?.thinking_levels || [];
 
     const menu = new Gio.Menu();
     if (this._agentProfiles?.length) {
@@ -1050,13 +1076,19 @@ class UsherWindow extends Adw.ApplicationWindow {
       for (const name of backends) backendMenu.append(name, `win.new-backend::${name}`);
       runtime.append_submenu('Backend', backendMenu);
     }
-    if (models.length) {
-      const modelMenu = new Gio.Menu();
-      modelMenu.append('Default', 'win.new-model::');
-      for (const model of models) {
-        modelMenu.append(model.display_name || model.id, `win.new-model::${model.id}`);
+    const modelMenu = new Gio.Menu();
+    for (const model of models) {
+      modelMenu.append(model.display_name || model.id, `win.new-model::${model.id}`);
+    }
+    runtime.append_submenu('Model', modelMenu);
+    if (levels.length) {
+      const effortMenu = new Gio.Menu();
+      effortMenu.append('Default', 'win.new-effort::');
+      for (const level of levels) effortMenu.append(level, `win.new-effort::${level}`);
+      if (this._newEffort && !levels.includes(this._newEffort)) {
+        effortMenu.append(`${this._newEffort} (unavailable)`, `win.new-effort::${this._newEffort}`);
       }
-      runtime.append_submenu('Model', modelMenu);
+      runtime.append_submenu('Effort', effortMenu);
     }
     menu.append_section(null, runtime);
     this._newConfig.set_menu_model(menu);
@@ -1064,50 +1096,75 @@ class UsherWindow extends Adw.ApplicationWindow {
     this.lookup_action('new-agent')?.set_state(GLib.Variant.new_string(this._newAgent));
     this.lookup_action('new-backend')?.set_state(GLib.Variant.new_string(backend));
     this.lookup_action('new-model')?.set_state(GLib.Variant.new_string(this._newModel));
+    this.lookup_action('new-effort')?.set_state(GLib.Variant.new_string(this._newEffort));
 
     const modelLabel = models.find(m => m.id === this._newModel)?.display_name ||
       this._newModel;
     const summary = this._newAgent ||
-      [backend, modelLabel].filter(Boolean).join(' · ') || 'Default';
+      [backend, modelLabel, this._newEffort].filter(Boolean).join(' · ') || 'Default';
     this._newConfig.set_label(ellipsize(summary, 28));
     // The picker wears the backend's colour, as the web one does; that is what
     // carries the choice once the label is elided down to the model.
     for (const name of BACKENDS) this._newConfig.remove_css_class(`backend-${name}`);
     if (BACKENDS.includes(backend)) this._newConfig.add_css_class(`backend-${backend}`);
     this._title.set_subtitle(this._newAgent ? `agent: ${this._newAgent}` : '');
+    this._syncApproval();
+  }
+
+  // Custom starts from the default agent (Settings → Agents).
+  _useNewDefaults() {
+    const d = this._defaultAgent || {};
+    const backends = this._backendCatalog?.backends || [];
+    this._newAgent = '';
+    this._newBackend = backends.includes(d.backend) ? d.backend : (backends[0] || 'claude');
+    const own = d.backend === this._newBackend;
+    this._newModel = own && d.model ? d.model : 'default';
+    this._newEffort = own ? (d.effort || '') : '';
+    this._newApproval = d.approval || '';
+    if (!this._newCwd.get_text() && d.cwd) this._newCwd.set_text(d.cwd);
+    this._syncNewConfig();
   }
 
   // Choosing an agent fills in what that agent has an opinion about; the
   // fields stay editable, so anything changed afterwards is sent as an
   // override.
   _applyNewAgent(name) {
-    this._newAgent = name;
     const profile = this._agentProfiles?.find(p => p.name === name);
-    if (profile) {
-      if (profile.cwd) this._newCwd.set_text(profile.cwd);
-      if (profile.backend) this._newBackend = profile.backend;
-      this._newModel = profile.model || '';
-      this._updatingAutoApprove = true;
-      this._autoApprove.set_active(Boolean(profile.auto_approve));
-      this._autoApprove.set_label(`Approve: ${profile.auto_approve ? 'auto' : 'ask'}`);
-      this._updatingAutoApprove = false;
+    if (!profile) {
+      this._useNewDefaults();
+      return;
     }
+    this._newAgent = name;
+    if (profile.cwd) this._newCwd.set_text(profile.cwd);
+    if (profile.backend) this._newBackend = profile.backend;
+    this._newModel = profile.model || 'default';
+    this._newEffort = profile.effort || '';
+    this._newApproval = profile.approval || '';
     this._syncNewConfig();
   }
 
+  // An effort the newly picked model also has stays.
+  _keptNewEffort() {
+    const model = this._catalogModel(
+      this._backendCatalog?.models?.[this._newBackend], this._newModel);
+    return (model?.thinking_levels || []).includes(this._newEffort) ? this._newEffort : '';
+  }
+
+  // Omitted values inherit from the agent; edited ones are explicit
+  // overrides. Custom always sends cwd, backend and model.
   async _createSession(text) {
-    const request = {
-      cwd: this._newCwd.get_text().trim(),
-      initialMessage: text,
-      backend: this._newBackend,
-      model: this._newModel,
-      agent: this._newAgent,
-      autoApprove: this._autoApprove.get_active(),
-    };
-    // An agent can supply the working directory; without one it is required.
-    if (!request.cwd && !request.agent) {
-      this._showToast('Choose an agent or set a working directory');
-      return;
+    const profile = this._agentProfiles?.find(p => p.name === this._newAgent);
+    const cwd = this._newCwd.get_text().trim();
+    const request = { initialMessage: text, agent: this._newAgent };
+    if (!profile || cwd !== (profile.cwd || '')) request.cwd = cwd;
+    if (!profile || this._newBackend !== (profile.backend || '')) request.backend = this._newBackend;
+    if (!profile || this._newModel !== (profile.model || '')) request.model = this._newModel;
+    // "default" overrides an agent's effort.
+    if (profile ? this._newEffort !== (profile.effort || '') : this._newEffort) {
+      request.effort = this._newEffort || 'default';
+    }
+    if (this._newApproval && (!profile || this._newApproval !== (profile.approval || ''))) {
+      request.approval = this._newApproval;
     }
     this._sendInFlight = true;
     this._syncComposerActions();
@@ -1178,14 +1235,20 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._title.set_title(session.title || '(untitled)');
       this._title.set_subtitle(ellipsize(`${session.backend} · ${session.cwd}`, 200));
       this._currentSession = session;
-      this._syncAutoApprove();
+      this._syncApproval();
+      this._runtimeKey = null;
       this._renderRuntime(session.runtime);
+      this._loadBackendCatalog().then(() => {
+        if (this._selectionEpoch !== epoch || this._selectedId !== id) return;
+        this._syncApproval();
+        this._renderRuntime(this._runtime);
+      });
       this._loadCommands(id, epoch);
       if (!await this._loadTranscript(id, epoch)) return;
       if (this._selectionEpoch !== epoch || this._selectedId !== id) return;
       this._status.set_visible(false);
       this._chatScroll.set_visible(true);
-      this._composer.set_visible(!session.is_subagent);
+      this._composer.set_visible(!session.subagent);
       if (this._splitView.get_collapsed()) this._splitView.set_show_sidebar(false);
       this._interactionKey = null;
       this._updateInteractions(this._pendingInteractions);
@@ -1362,39 +1425,163 @@ class UsherWindow extends Adw.ApplicationWindow {
     }
   }
 
+  // The usage popover: model and effort (switchable), context use, and
+  // agents, loops, wake-ups and goals.
   _renderRuntime(runtime) {
-    const context = Number(runtime?.context_tokens) || 0;
-    if (context <= 0) {
-      this._usage.set_visible(false);
-      return;
-    }
-    const window = Number(runtime?.context_window) || 0;
-    const percent = window > 0 ? Math.min(100, Math.round(context / window * 100)) : 0;
-    this._usage.set_visible(true);
-    this._usageFraction = window > 0 ? percent / 100 : 0;
+    runtime = runtime || {};
+    this._runtime = runtime;
+    const session = this._currentSession;
+    const activity = session?.activity || {};
+    const context = Number(runtime.context_tokens) || 0;
+    const window = Number(runtime.context_window) || 0;
+    const activityRows = this._activityRows(activity, isBusy(session || {}));
+    const visible = Boolean(runtime.model || runtime.effort || context > 0 || activityRows.length);
+    this._usage.set_visible(visible);
+    if (!visible) return;
+    const measured = context > 0 && window > 0;
+    const percent = measured ? Math.min(100, Math.round(context / window * 100)) : 0;
+    this._usageFraction = percent / 100;
     this._usageRing.queue_draw();
-    this._usage.set_tooltip_text(window > 0
-      ? `Context ${percent}% used` : 'Context limit unavailable');
+    const models = this._switchableModels();
+    const current = this._catalogModel(models, runtime.model);
+    const modelName = current?.display_name ||
+      this._catalogModel(this._sessionModels(), runtime.model)?.display_name || runtime.model;
+    this._usage.set_tooltip_text(
+      [[modelName, runtime.effort].filter(Boolean).join(', '),
+        measured ? `Context ${percent}% used` : 'Context usage unavailable']
+        .filter(Boolean).join(' · '));
+
+    // A rebuild would close an open dropdown.
+    const key = JSON.stringify([runtime, activityRows, models.map(m => m.id), session?.id]);
+    if (key === this._runtimeKey) return;
+    this._runtimeKey = key;
 
     let child;
     while ((child = this._usageDetail.get_first_child())) this._usageDetail.remove(child);
     const addRow = (name, value) => {
       const row = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 18 });
-      const key = new Gtk.Label({ label: name, xalign: 0, hexpand: true });
-      key.add_css_class('dim-label');
-      row.append(key);
-      row.append(new Gtk.Label({ label: value, xalign: 1 }));
+      const label = new Gtk.Label({ label: name, xalign: 0, hexpand: true, valign: Gtk.Align.CENTER });
+      label.add_css_class('dim-label');
+      row.append(label);
+      if (typeof value === 'string') {
+        row.append(new Gtk.Label({
+          label: value, xalign: 1, wrap: true, max_width_chars: 40,
+          wrap_mode: Pango.WrapMode.WORD_CHAR, justify: Gtk.Justification.RIGHT,
+        }));
+      } else {
+        row.append(value);
+      }
       this._usageDetail.append(row);
     };
-    if (runtime.model) addRow('Model', runtime.model);
-    if (runtime.effort) addRow('Effort', runtime.effort);
-    addRow('Context', window > 0
-      ? `${this._formatTokens(context)} / ${this._formatTokens(window)}`
-      : `${this._formatTokens(context)} / unavailable`);
-    if (window > 0) {
+    const id = session?.id;
+    if (models.length) {
+      addRow('Model', this._runtimeDropDown(
+        models.map(m => ({ id: m.id, label: m.display_name || m.id })),
+        current?.id || '', runtime.model || 'default',
+        value => this._switchRuntime(id, 'model', value)));
+    } else if (runtime.model) {
+      addRow('Model', runtime.model);
+    }
+    const levels = current?.thinking_levels || [];
+    if (levels.length) {
+      const choices = levels.map(l => ({ id: l, label: l }));
+      // Only Claude can drop a switch.
+      if (session?.backend === 'claude') choices.unshift({ id: 'default', label: 'default' });
+      addRow('Effort', this._runtimeDropDown(
+        choices, runtime.effort || 'default', runtime.effort || 'default',
+        value => this._switchRuntime(id, 'effort', value)));
+    } else if (runtime.effort) {
+      addRow('Effort', runtime.effort);
+    }
+    addRow('Context', context > 0
+      ? `${this._formatTokens(context)} / ${measured ? this._formatTokens(window) : 'unavailable'}`
+      : 'unavailable');
+    if (measured) {
       const bar = new Gtk.LevelBar({ min_value: 0, max_value: 100, value: percent });
       bar.set_size_request(200, -1);
       this._usageDetail.append(bar);
+    }
+    for (const [name, text] of activityRows) addRow(name, text);
+  }
+
+  // An id outside the choices shows as is.
+  _runtimeDropDown(choices, selected, fallback, pick) {
+    const list = [...choices];
+    if (!list.some(c => c.id === selected)) list.push({ id: selected, label: fallback });
+    const dropdown = Gtk.DropDown.new_from_strings(list.map(c => c.label));
+    dropdown.set_selected(list.findIndex(c => c.id === selected));
+    dropdown.set_valign(Gtk.Align.CENTER);
+    dropdown.connect('notify::selected', d => {
+      const choice = list[d.get_selected()];
+      if (choice && choice.id !== selected) pick(choice.id);
+    });
+    return dropdown;
+  }
+
+  async _switchRuntime(id, field, value) {
+    if (!id || id !== this._selectedId) return;
+    try {
+      const session = await this._api.patchSession(id, { [field]: value });
+      if (id !== this._selectedId) return;
+      this._currentSession = { ...this._currentSession, ...session };
+      this._renderRuntime(session.runtime);
+    } catch (error) {
+      if (id !== this._selectedId) return;
+      this._runtimeKey = null; // put the dropdown back on what is in effect
+      this._renderRuntime(this._runtime);
+      this._showToast(`${field[0].toUpperCase()}${field.slice(1)} switch failed: ${error.message || error}`);
+    }
+  }
+
+  _sessionModels() {
+    return this._backendCatalog?.models?.[this._currentSession?.backend] || [];
+  }
+
+  // Aliases are left out: a session reports the model behind one.
+  _switchableModels() {
+    const session = this._currentSession;
+    if (!session || session.subagent) return [];
+    return this._sessionModels().filter(m => !m.alias);
+  }
+
+  // A pi session reports its model without the provider prefix.
+  _catalogModel(models, id) {
+    if (!id) return null;
+    return (models || []).find(m => m.id === id || m.id.endsWith(`/${id}`)) || null;
+  }
+
+  // A schedule without a live process is stopped; it comes back on resume.
+  _activityRows(activity, live) {
+    const rows = [];
+    const stopped = live ? '' : ' · stopped';
+    if (activity.agents > 0) rows.push(['Agents', `${activity.agents} running`]);
+    for (const loop of activity.loops || []) {
+      const prompt = loop.prompt ? ` — ${ellipsize(loop.prompt, 48)}` : '';
+      rows.push(['Loop', `${loop.schedule}${prompt}${stopped}`]);
+    }
+    const wake = activity.next_wake && Date.parse(activity.next_wake);
+    if (wake && wake > Date.now()) {
+      const time = new Date(wake);
+      rows.push(['Wake',
+        `${time.getHours()}:${String(time.getMinutes()).padStart(2, '0')}${stopped}`]);
+    }
+    if (activity.goal) {
+      rows.push(['Goal', `${activity.goal.condition} (${activity.goal.status || 'active'})`]);
+      if (activity.goal.reason) rows.push(['Last', activity.goal.reason]);
+    }
+    return rows;
+  }
+
+  // Fetched once per connection.
+  async _loadBackendCatalog() {
+    if (this._backendCatalog) return this._backendCatalog;
+    const epoch = this._connectionEpoch;
+    try {
+      const catalog = await this._api.listBackends();
+      if (this._connectionEpoch === epoch) this._backendCatalog = catalog;
+      return catalog;
+    } catch (_) {
+      return null;
     }
   }
 
@@ -1404,42 +1591,56 @@ class UsherWindow extends Adw.ApplicationWindow {
     return `${(count / 1000000).toFixed(1)}m`.replace('.0', '');
   }
 
-  _syncAutoApprove() {
-    // In the new-session view the toggle is a preset for a session that does
-    // not exist yet, so it keeps whatever the user (or a chosen agent) set.
-    const enabled = this._newMode
-      ? this._autoApprove.get_active()
-      : Boolean(this._currentSession?.auto_approve);
-    this._updatingAutoApprove = true;
-    this._autoApprove.set_active(enabled);
-    this._autoApprove.set_label(`Approve: ${enabled ? 'auto' : 'ask'}`);
-    this._updatingAutoApprove = false;
+  // In the new-session view, the approval the session will be created with.
+  _currentApproval() {
+    return (this._newMode ? this._newApproval : this._currentSession?.approval) || 'ask';
   }
 
-  async _toggleAutoApprove() {
-    if (this._updatingAutoApprove) return;
+  _approvalChoices() {
+    const backend = this._newMode ? this._newBackend : this._currentSession?.backend;
+    const listed = this._backendCatalog?.approvals?.[backend];
+    return listed?.length ? listed : (this._newMode ? Object.keys(APPROVALS) : []);
+  }
+
+  _syncApproval() {
+    // A pick the new backend does not offer falls back to asking.
+    if (this._newMode && this._newApproval && this._backendCatalog &&
+        !this._approvalChoices().includes(this._newApproval)) {
+      this._newApproval = '';
+    }
+    const current = this._currentApproval();
+    const choices = this._approvalChoices();
+    const menu = new Gio.Menu();
+    for (const approval of Object.keys(APPROVALS)) {
+      if (!choices.includes(approval) && approval !== current) continue;
+      menu.append(`${approval} — ${APPROVALS[approval]}`, `win.approval::${approval}`);
+    }
+    this._approval.set_menu_model(menu);
+    this._approval.set_label(`Approve: ${current}`);
+    if (current === 'ask') this._approval.remove_css_class('unattended');
+    else this._approval.add_css_class('unattended');
+    this.lookup_action('approval')?.set_state(GLib.Variant.new_string(current));
+  }
+
+  async _pickApproval(approval) {
+    if (approval === this._currentApproval()) return;
     if (this._newMode) {
       // Nothing to persist yet; it rides along with the create request.
-      this._autoApprove.set_label(
-        `Approve: ${this._autoApprove.get_active() ? 'auto' : 'ask'}`);
+      this._newApproval = approval;
+      this._syncApproval();
       return;
     }
-    if (!this._selectedId || !this._currentSession) return;
     const session = this._currentSession;
-    const sessionId = this._selectedId;
-    const enabled = this._autoApprove.get_active();
-    const previous = Boolean(session.auto_approve);
-    this._autoApprove.set_label(`Approve: ${enabled ? 'auto' : 'ask'}`);
-    this._autoApprove.set_sensitive(false);
+    if (!session || session.id !== this._selectedId) return;
+    this._approval.set_sensitive(false);
     try {
-      await this._api.setAutoApprove(sessionId, enabled);
-      session.auto_approve = enabled;
+      const updated = await this._api.patchSession(session.id, { approval });
+      session.approval = updated?.approval || approval;
     } catch (error) {
-      session.auto_approve = previous;
-      if (this._currentSession === session) this._syncAutoApprove();
-      this._showToast(`Auto-approve update failed: ${error.message || error}`);
+      this._showToast(`Approval update failed: ${error.message || error}`);
     } finally {
-      this._autoApprove.set_sensitive(true);
+      this._approval.set_sensitive(true);
+      if (this._currentSession === session) this._syncApproval();
     }
   }
 
@@ -1576,37 +1777,65 @@ class UsherWindow extends Adw.ApplicationWindow {
 
   _openEvents(id, epoch = this._selectionEpoch) {
     this._eventStream?.stop();
+    const reload = () => this._loadTranscript(id).catch(error => this._showToast(error.message));
+    // Mid-turn, the reload at the turn's end does it.
+    const reloadIdle = () => { if (!this._turnRunning) reload(); };
+    const handlers = {
+      // Snapshot on connect: a turn already running.
+      'turn.active': () => { this._setTurnRunning(true); this._beginLiveTurn(); },
+      'turn.started': () => { this._setTurnRunning(true); this._beginLiveTurn(); },
+      // Snapshot on connect: no turn running.
+      'turn.idle': () => { this._setTurnRunning(false); reload(); },
+      // Picks up a new session's title and any loop or goal the turn set.
+      'turn.ended': () => {
+        this._setTurnRunning(false);
+        reload();
+        this._refreshCurrentSession(id, epoch);
+      },
+      // The server keeps the error as the transcript's last turn.
+      'turn.failed': data => {
+        this._showToast(`Turn failed: ${data?.message || 'unknown error'}`);
+        this._setTurnRunning(false);
+        reload();
+      },
+      'turn.prompt': data => this._appendUserTurn(data),
+      'turn.part': data => this._appendLivePart(data),
+      'turn.delta': data => this._appendLiveDelta(data),
+      'turn.status': data => {
+        this._beginLiveTurn();
+        if (data?.status === 'thinking') this._setLiveStatus('Thinking…');
+        if (data?.status === 'retrying') {
+          this._setLiveStatus(`Retrying…${data.detail ? ` ${data.detail}` : ''}`);
+        }
+      },
+      // A notice can retract parts already streamed (a refused partial).
+      'turn.notice': reloadIdle,
+      'relay.landed': reloadIdle,
+      'session.runtime': data => this._renderRuntime({ ...this._runtime, ...data }),
+    };
     this._eventStream = new EventStream(
       this._api.session,
-      `${this._backend.baseUrl}/api/sessions/${encodeURIComponent(id)}/events`,
+      this._api.eventsUrl(id),
       (name, data) => {
         if (this._selectionEpoch !== epoch || this._selectedId !== id) return;
-        if (name === 'turn.active' || name === 'subprocess.started') {
-          this._setTurnRunning(true);
-          this._beginLiveTurn();
-        }
-        if (name === 'turn.idle' || name === 'subprocess.exit' || name === 'error') {
-          if (name === 'error') {
-            this._showToast(`Turn failed: ${data?.message || 'unknown error'}`);
-          }
-          this._setTurnRunning(false);
-          this._loadTranscript(id).catch(error => this._showToast(error.message));
-        }
-        if (name === 'turn.user') {
-          this._appendUserTurn(data);
-        }
-        if (name === 'part') this._appendLivePart(data);
-        if (name === 'part.delta') this._appendLiveDelta(data);
-        if (name === 'session.runtime') this._renderRuntime(data);
-        // The backend says it is reasoning before it emits anything to show.
-        if (name === 'turn.status' && data?.status === 'thinking') {
-          this._beginLiveTurn();
-          this._setLiveStatus('Thinking…');
-        }
+        handlers[name]?.(data);
       },
       (state, error) => this._setStreamState(state, error)
     );
     this._eventStream.start();
+  }
+
+  async _refreshCurrentSession(id, epoch) {
+    try {
+      const session = await this._api.getSession(id);
+      if (this._selectionEpoch !== epoch || this._selectedId !== id) return;
+      this._currentSession = session;
+      this._title.set_title(session.title || '(untitled)');
+      this._syncApproval();
+      this._renderRuntime(session.runtime);
+    } catch (_) {
+      // The next poll brings it back.
+    }
   }
 
   // An unconfirmed echo of what was just sent. It carries no key, so the
@@ -1651,7 +1880,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     if (!text) return;
     this._sendInFlight = true;
     this._syncComposerActions();
-    // The canonical turn replaces this echo when turn.user lands.
+    // The canonical turn replaces this echo when turn.prompt lands.
     buffer.set_text('', -1);
     this._drafts.delete(id);
     this._appendOptimisticTurn(text);
@@ -1967,6 +2196,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._eventStream = null;
     this._selectionEpoch++;
     this._connectionEpoch++;
+    this._backendCatalog = null;
     this._selectedId = null;
     this._backend.configure(serverConfig);
     this._api.setBaseUrl(this._backend.baseUrl);
@@ -2059,6 +2289,7 @@ class UsherWindow extends Adw.ApplicationWindow {
   _disconnect() {
     this._selectionEpoch++;
     this._connectionEpoch++;
+    this._backendCatalog = null;
     this._eventStream?.stop();
     this._backend.stop();
     this._currentServer = null;
@@ -2113,7 +2344,7 @@ class UsherWindow extends Adw.ApplicationWindow {
 
   _appendUserTurn(data) {
     if (!data?.content) return;
-    const turn = { role: 'user', content: data.content, ts: data.ts || '' };
+    const turn = { role: 'user', content: data.content, ts: data.ts || '', origin: data.origin || '' };
     const key = this._turnKey(turn);
     // This is the canonical version of what was echoed on send: drop the echo
     // rather than show the message twice. A prompt from another frontend has
@@ -2129,7 +2360,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     });
   }
 
-  // A 'part' SSE event wraps the server-rendered TurnPart:
+  // A 'turn.part' event's data wraps the server-rendered TurnPart:
   // { role, ts, model, part: {type, content, content_kind, tool_name, tool_target} }.
   _appendLivePart(data) {
     const part = data?.part;
@@ -2147,7 +2378,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._growTranscript(() => this._refreshLiveTurn());
   }
 
-  // 'part.delta' grows an ephemeral text preview; the complete JSONL-derived
+  // 'turn.delta' grows an ephemeral text preview; the complete JSONL-derived
   // part remains canonical and replaces it when it arrives. Re-rendering the
   // whole live turn per token would thrash the ListView, so refreshes are
   // batched on a short timer.

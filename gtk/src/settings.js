@@ -10,6 +10,9 @@
 import Adw from 'gi://Adw?version=1';
 import Gtk from 'gi://Gtk?version=4.0';
 
+import { APPROVALS } from './approvals.js';
+import { formatArgs, parseArgs } from './text.js';
+
 const CRON_PRESETS = [
   ['0 9 * * mon-fri', 'Weekdays 9am'],
   ['0 3 * * *', 'Nightly 3am'],
@@ -25,10 +28,10 @@ function addRow(title, onActivate) {
   return row;
 }
 
-function confirmDelete(parent, heading, body, onConfirm) {
+function confirmDelete(parent, heading, body, onConfirm, label = 'Delete') {
   const dialog = new Adw.AlertDialog({ heading, body });
   dialog.add_response('cancel', 'Cancel');
-  dialog.add_response('delete', 'Delete');
+  dialog.add_response('delete', label);
   dialog.set_response_appearance('delete', Adw.ResponseAppearance.DESTRUCTIVE);
   dialog.set_close_response('cancel');
   dialog.connect('response', (_dialog, response) => {
@@ -146,32 +149,78 @@ function modelChoices(catalog, backendName) {
     .map(model => ({ value: model.id, label: model.display_name || model.id }));
 }
 
-// Adds a backend row and a model row to `group`, in that order. The model list
-// depends on the chosen backend, so its row is rebuilt on every backend
-// change — it must therefore be the last row added to that group.
-function backendModelRows(catalog, group, backend, model) {
+// Adds backend and model rows to `group`, and with `extras` effort and
+// approval rows. Dependent rows are rebuilt on every change, so they must be
+// the last rows in that group.
+function backendModelRows(catalog, group, backend, model, extras = null) {
   const backendInput = choiceRow('Backend', backendChoices(catalog), backend);
   group.add(backendInput.row);
   let modelInput = null;
-  const rebuild = (keep) => {
-    if (modelInput) group.remove(modelInput.row);
-    const chosen = backendInput.value || (catalog?.backends || [])[0] || '';
-    modelInput = choiceRow('Model', modelChoices(catalog, chosen), keep);
-    group.add(modelInput.row);
+  let effortInput = null;
+  let approvalInput = null;
+  const chosenBackend = () => backendInput.value || (catalog?.backends || [])[0] || '';
+  const rebuildExtras = (effort, approval) => {
+    if (!extras) return;
+    if (effortInput) group.remove(effortInput.row);
+    if (approvalInput) group.remove(approvalInput.row);
+    const levels = effortChoices(catalog, chosenBackend(), modelInput?.value || '');
+    if (effort && !levels.some(l => l.value === effort)) {
+      levels.push({ value: effort, label: `${effort} (unavailable)` });
+    }
+    effortInput = choiceRow('Effort', levels, effort);
+    group.add(effortInput.row);
+    approvalInput = fixedChoiceRow(
+      'Approval', approvalChoices(catalog, backendInput.value), approval || 'ask');
+    group.add(approvalInput.row);
   };
-  rebuild(model);
-  backendInput.row.connect('notify::selected', () => rebuild(''));
+  const rebuild = (keep, effort, approval) => {
+    if (modelInput) group.remove(modelInput.row);
+    modelInput = choiceRow('Model', modelChoices(catalog, chosenBackend()), keep);
+    group.add(modelInput.row);
+    // An effort the new model also has stays.
+    modelInput.row.connect('notify::selected', () =>
+      rebuildExtras(effortInput?.value || '', approvalInput?.value || ''));
+    rebuildExtras(effort, approval);
+  };
+  rebuild(model, extras?.effort || '', extras?.approval || '');
+  backendInput.row.connect('notify::selected', () =>
+    rebuild('', '', approvalInput?.value || ''));
   return {
     get backend() { return backendInput.value; },
     get model() { return modelInput ? modelInput.value : ''; },
+    get effort() { return effortInput ? effortInput.value : ''; },
+    get approval() { return approvalInput ? approvalInput.value : ''; },
     setBackend(value) { backendInput.set(value); },
     setModel(value) { modelInput?.set(value); },
   };
 }
 
 function agentSummary(agent) {
-  return [agent.backend, agent.model, agent.cwd].filter(Boolean).join(' · ') ||
-    'No defaults set';
+  const approval = agent.approval && agent.approval !== 'ask' ? `approve: ${agent.approval}` : '';
+  return [agent.backend, agent.model, agent.effort, approval, agent.cwd]
+    .filter(Boolean).join(' · ') || 'No defaults set';
+}
+
+function effortChoices(catalog, backendName, model) {
+  const entry = (catalog?.models?.[backendName] || []).find(m => m.id === model);
+  return (entry?.thinking_levels || []).map(level => ({ value: level, label: level }));
+}
+
+// With no backend pinned, every approval.
+function approvalChoices(catalog, backendName) {
+  const names = backendName ? (catalog?.approvals?.[backendName] || []) : Object.keys(APPROVALS);
+  return names.map(name => ({ value: name, label: `${name} — ${APPROVALS[name] || ''}` }));
+}
+
+// A choice row without a placeholder entry.
+function fixedChoiceRow(title, values, current) {
+  const list = [...values];
+  if (current && !list.some(v => v.value === current)) {
+    list.push({ value: current, label: `${current} (unavailable)` });
+  }
+  const row = new Adw.ComboRow({ title, model: Gtk.StringList.new(list.map(v => v.label)) });
+  row.set_selected(Math.max(0, list.findIndex(v => v.value === current)));
+  return { row, get value() { return list[row.get_selected()]?.value || ''; } };
 }
 
 // When the runner will start a task next. "Overdue" is the one place a stopped
@@ -215,7 +264,8 @@ export async function showSettingsDialog(parent, context) {
   });
   const agentsGroup = new Adw.PreferencesGroup({
     title: 'Agent profiles',
-    description: 'Reusable defaults for new sessions and scheduled tasks.',
+    description: 'Reusable defaults for new sessions and scheduled tasks. ' +
+      '“default” is used when nothing else is asked for.',
   });
   agentsPage.add(agentsGroup);
 
@@ -232,7 +282,7 @@ export async function showSettingsDialog(parent, context) {
 
   const loadAll = async () => {
     const [catalog, agentList, scheduleList] = await Promise.all([
-      api.listModels().catch(() => null),
+      api.listBackends().catch(() => null),
       api.listAgents().catch(() => ({ agents: [] })),
       api.listSchedules().catch(() => ({ schedules: [] })),
     ]);
@@ -288,14 +338,23 @@ export async function showSettingsDialog(parent, context) {
   const agentForm = (agent) => {
     const { page, prefs, cancel } = formSubpage(
       agent ? 'Edit Agent' : 'New Agent',
-      button => saveAgent(button, agent, collect())
+      button => {
+        let profile;
+        try { profile = collect(); } catch (error) { toast(error.message); return; }
+        saveAgent(button, agent, profile);
+      }
     );
     cancel.connect('clicked', () => dialog.pop_subpage());
 
+    // The default agent keeps its name; deleting it restores the built-in one.
+    const isDefault = agent?.name === 'default';
     const identity = new Adw.PreferencesGroup();
-    const nameRow = new Adw.EntryRow({ title: 'Name' });
+    const nameRow = new Adw.EntryRow({ title: 'Name', editable: !isDefault });
     nameRow.set_text(agent?.name || '');
     identity.add(nameRow);
+    if (isDefault) {
+      identity.set_description('Used when a new session asks for nothing else.');
+    }
     const cwdInput = suggestionRow(
       'Working directory', agent?.cwd, cwdSuggestions, 'Recent working directories'
     );
@@ -304,14 +363,9 @@ export async function showSettingsDialog(parent, context) {
 
     const runtime = new Adw.PreferencesGroup({ title: 'Runtime' });
     const pickers = backendModelRows(
-      state.catalog, runtime, agent?.backend || '', agent?.model || ''
+      state.catalog, runtime, agent?.backend || '', agent?.model || '',
+      { effort: agent?.effort || '', approval: agent?.approval || '' }
     );
-    const approveRow = new Adw.SwitchRow({
-      title: 'Auto-approve tool calls',
-      subtitle: 'Sessions from this agent start with permission prompts off.',
-      active: Boolean(agent?.auto_approve),
-    });
-    runtime.add(approveRow);
     prefs.add(runtime);
 
     // Both of these are the web form's Advanced section: rarely touched, and
@@ -322,10 +376,10 @@ export async function showSettingsDialog(parent, context) {
     advancedGroup.add(advanced);
     const extraArgs = new Adw.EntryRow({ title: 'Extra CLI flags' });
     extraArgs.add_css_class('monospace');
-    extraArgs.set_text((agent?.extra_args || []).join(' '));
+    extraArgs.set_text(formatArgs(agent?.extra_args));
     // usher appends these to the backend's own spawn flags.
     extraArgs.set_tooltip_text(
-      'Space-separated flags added when spawning this agent\'s backend');
+      'Flags added when spawning this agent\'s backend, quoted as in a shell');
     advanced.add_row(extraArgs);
     const prompt = multilineField(agent?.append_system_prompt);
     const promptBox = new Gtk.Box({
@@ -349,17 +403,18 @@ export async function showSettingsDialog(parent, context) {
       Boolean(agent?.append_system_prompt) || (agent?.extra_args || []).length > 0);
     prefs.add(advancedGroup);
 
+    // Throws on flags that do not parse.
     const collect = () => {
-      const flags = extraArgs.get_text().trim();
+      const flags = parseArgs(extraArgs.get_text());
       return {
         name: nameRow.get_text().trim(),
         cwd: cwdInput.value,
         backend: pickers.backend,
         model: pickers.model,
+        effort: pickers.effort,
+        approval: pickers.approval,
         append_system_prompt: prompt.value,
-        auto_approve: approveRow.get_active(),
-        // The API wants an array, and an empty field must not send [""].
-        extra_args: flags ? flags.split(/\s+/) : undefined,
+        extra_args: flags.length ? flags : undefined,
       };
     };
 
@@ -367,31 +422,38 @@ export async function showSettingsDialog(parent, context) {
       const actions = new Adw.PreferencesGroup();
       const duplicate = new Adw.ButtonRow({ title: 'Duplicate' });
       duplicate.connect('activated', () => {
-        const copy = collect();
+        let copy;
+        try { copy = collect(); } catch (error) { toast(error.message); return; }
         copy.name = `${copy.name}-copy`;
         saveAgent(duplicate, agent, copy, { duplicate: true });
       });
       actions.add(duplicate);
-      const remove = new Adw.ButtonRow({ title: 'Delete Agent' });
-      remove.add_css_class('destructive-action');
-      remove.connect('activated', () => confirmDelete(
-        parent,
-        `Delete “${agent.name}”?`,
-        'Sessions already created from this agent are unaffected.',
-        async () => {
-          try {
-            await api.deleteAgent(agent.name);
-            dialog.pop_subpage();
-            await loadAll();
-            renderAgents();
-            renderSchedules();
-            toast('Agent deleted');
-          } catch (error) {
-            toast(error.message || String(error));
-          }
-        }
-      ));
-      actions.add(remove);
+      // The built-in default agent has nothing stored to reset.
+      if (!agent.builtin) {
+        const remove = new Adw.ButtonRow({ title: isDefault ? 'Reset to Built-in' : 'Delete Agent' });
+        remove.add_css_class('destructive-action');
+        remove.connect('activated', () => confirmDelete(
+          parent,
+          isDefault ? 'Reset the default agent?' : `Delete “${agent.name}”?`,
+          isDefault
+            ? 'It goes back to the built-in one. Existing sessions are unaffected.'
+            : 'Sessions already created from this agent are unaffected.',
+          async () => {
+            try {
+              await api.deleteAgent(agent.name);
+              dialog.pop_subpage();
+              await loadAll();
+              renderAgents();
+              renderSchedules();
+              toast(isDefault ? 'Default agent reset' : 'Agent deleted');
+            } catch (error) {
+              toast(error.message || String(error));
+            }
+          },
+          isDefault ? 'Reset' : 'Delete'
+        ));
+        actions.add(remove);
+      }
       prefs.add(actions);
     }
     return page;

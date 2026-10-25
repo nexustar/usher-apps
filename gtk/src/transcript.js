@@ -153,9 +153,29 @@ export class TranscriptView {
         if (turn.uuid) footer.append(this.forkButton(turn.uuid));
         if (footer.get_first_child()) outer.append(footer);
       }
-    } else if (turn.role !== 'user' && turn.role !== 'assistant') {
-      // Context-compaction markers and similar system notices: a centered,
-      // dim, compact marker instead of a speech bubble.
+    } else if (turn.role === 'error' ||
+               (turn.role === 'system' && turn.content !== 'Context compacted')) {
+      // Errors and notices are the backend's words, verbatim.
+      const text = new Gtk.Label({
+        label: `${turn.role === 'error' ? '■ ' : ''}${turn.content || ''}`,
+        xalign: 0,
+        wrap: true,
+        wrap_mode: Pango.WrapMode.WORD_CHAR,
+        selectable: true,
+      });
+      if (turn.role === 'error') {
+        text.add_css_class('turn-error');
+      } else {
+        text.add_css_class('notice');
+        if (turn.level === 'warning') text.add_css_class('warning');
+        else text.add_css_class('dim-label');
+      }
+      outer.append(text);
+      const footer = this.turnFooter(turn.ts, false);
+      if (footer.get_first_child()) outer.append(footer);
+    } else if (turn.role !== 'user') {
+      // Context-compaction markers: a centered, dim, compact marker instead
+      // of a speech bubble.
       const marker = new Gtk.Label({
         label: turn.content || turn.role,
         halign: Gtk.Align.CENTER,
@@ -172,6 +192,10 @@ export class TranscriptView {
       inner.append(this.renderText(turn.content || ''));
       const bubble = new Gtk.Box({ halign: Gtk.Align.END });
       bubble.add_css_class('user-bubble');
+      if (turn.origin) {
+        bubble.add_css_class('injected');
+        bubble.set_tooltip_text(`Sent by ${turn.origin}, not typed`);
+      }
       bubble.append(inner);
       // Keep the bubble clear of the left edge so even a long prompt still
       // reads as right-aligned speech.

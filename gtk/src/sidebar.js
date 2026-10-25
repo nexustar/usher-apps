@@ -349,10 +349,10 @@ export class Sidebar {
   render(all) {
     // Subagents are read-only children of the session that spawned them; they
     // hang off their parent row rather than competing with it in the list.
-    const sessions = all.filter(s => !s.is_subagent);
+    const sessions = all.filter(s => !s.subagent);
     const children = new Map();
     for (const session of all) {
-      if (!session.is_subagent || !session.parent_id) continue;
+      if (!session.subagent || !session.parent_id) continue;
       if (!children.has(session.parent_id)) children.set(session.parent_id, []);
       children.get(session.parent_id).push(session);
     }

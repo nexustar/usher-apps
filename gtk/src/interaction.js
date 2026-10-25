@@ -5,6 +5,7 @@
 import Gtk from 'gi://Gtk?version=4.0';
 import Pango from 'gi://Pango';
 
+import * as markdown from './markdown.js';
 import { ellipsize } from './text.js';
 
 // ctx: { respond(id, payload, buttons) }
@@ -31,37 +32,59 @@ export class InteractionCards {
     return frame;
   }
 
+  // The server's preview of the call, else its raw input.
   permissionWidget(pending, total) {
+    if (pending.kind === 'plan') return this.planWidget(pending, total);
+    const preview = pending.preview;
     const box = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6 });
     const heading = new Gtk.Label({
-      label: `Permission: ${pending.tool_name || pending.kind || 'tool'}` +
+      label: `Permission: ${preview?.tool_name || pending.tool_name || pending.kind || 'tool'}` +
         (total > 1 ? ` (1 of ${total})` : ''),
       xalign: 0,
       ellipsize: Pango.EllipsizeMode.END,
     });
     heading.add_css_class('heading');
     box.append(heading);
+    if (preview?.tool_target) {
+      const target = new Gtk.Label({
+        label: ellipsize(preview.tool_target, 300),
+        tooltip_text: preview.tool_target,
+        xalign: 0,
+        ellipsize: Pango.EllipsizeMode.MIDDLE,
+      });
+      target.add_css_class('monospace');
+      target.add_css_class('caption');
+      box.append(target);
+    }
+    if (pending.reason) {
+      const reason = new Gtk.Label({
+        label: pending.reason, xalign: 0, wrap: true, wrap_mode: Pango.WrapMode.WORD_CHAR,
+      });
+      reason.add_css_class('dim-label');
+      box.append(reason);
+    }
 
-    let inputText = '';
-    try { inputText = JSON.stringify(pending.tool_input ?? {}, null, 2); }
-    catch (_) { inputText = String(pending.tool_input || ''); }
-    const input = new Gtk.Label({
-      label: ellipsize(inputText, 4000),
-      xalign: 0,
-      yalign: 0,
-      selectable: true,
-      wrap: true,
-      wrap_mode: Pango.WrapMode.WORD_CHAR,
-    });
-    input.add_css_class('monospace');
-    input.add_css_class('caption');
-    box.append(new Gtk.ScrolledWindow({
-      child: input,
+    const scrolled = child => new Gtk.ScrolledWindow({
+      child,
       hscrollbar_policy: Gtk.PolicyType.NEVER,
-      max_content_height: 150,
+      max_content_height: 200,
       propagate_natural_height: true,
       hexpand: true,
-    }));
+    });
+    if (!preview) {
+      let inputText = '';
+      try { inputText = JSON.stringify(pending.tool_input ?? {}, null, 2); }
+      catch (_) { inputText = String(pending.tool_input || ''); }
+      box.append(scrolled(markdown.codeWidget(ellipsize(inputText, 4000))));
+    } else {
+      if (preview.tool_input) {
+        box.append(scrolled(markdown.codeWidget(ellipsize(preview.tool_input, 4000))));
+      }
+      if (preview.content) {
+        box.append(scrolled(markdown.codeWidget(
+          ellipsize(preview.content, 8000), preview.content_kind === 'diff')));
+      }
+    }
 
     const actions = new Gtk.Box({ spacing: 6, halign: Gtk.Align.END });
     const deny = new Gtk.Button({ label: 'Deny' });
@@ -85,7 +108,40 @@ export class InteractionCards {
     );
     deny.connect('clicked', () => respond('deny', 'once'));
     allow.connect('clicked', () => respond('allow', 'once'));
-    always?.connect('clicked', () => respond('allow', 'session'));
+    always?.connect('clicked', () => respond('allow', 'always'));
+    return box;
+  }
+
+  // Approving a plan to leave plan mode.
+  planWidget(pending, total) {
+    const box = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6 });
+    const heading = new Gtk.Label({
+      label: `Plan${total > 1 ? ` (1 of ${total})` : ''}`, xalign: 0,
+    });
+    heading.add_css_class('heading');
+    box.append(heading);
+    box.append(new Gtk.ScrolledWindow({
+      child: markdown.render(pending.preview?.content || ''),
+      hscrollbar_policy: Gtk.PolicyType.NEVER,
+      max_content_height: 360,
+      propagate_natural_height: true,
+      hexpand: true,
+    }));
+    const actions = new Gtk.Box({ spacing: 6, halign: Gtk.Align.END });
+    const keep = new Gtk.Button({ label: 'Keep Planning' });
+    const approve = new Gtk.Button({ label: 'Approve' });
+    approve.add_css_class('suggested-action');
+    actions.append(keep);
+    actions.append(approve);
+    box.append(actions);
+    const buttons = [keep, approve];
+    keep.connect('clicked', () => this._ctx.respond(
+      pending.id,
+      { behavior: 'deny', scope: 'once', reason: 'The user wants to keep planning.' },
+      buttons
+    ));
+    approve.connect('clicked', () => this._ctx.respond(
+      pending.id, { behavior: 'allow', scope: 'once' }, buttons));
     return box;
   }
 

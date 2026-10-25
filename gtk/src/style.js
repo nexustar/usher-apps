@@ -38,6 +38,20 @@ const CSS = `
   border-radius: 20px;
 }
 
+/* A prompt the user did not type (a task notification, a peer). */
+.user-bubble.injected {
+  background-color: transparent;
+  border: 1px dashed alpha(currentColor, 0.3);
+}
+
+.turn-error {
+  color: @error_color;
+}
+
+.notice.warning {
+  color: @warning_color;
+}
+
 /* Tool calls recede into the background: an outline and nothing else, which
    is what the web settled on — they are scaffolding, not content. */
 .tool-card {
@@ -121,22 +135,14 @@ const CSS = `
   border-radius: 8px;
 }
 
-/* Auto-approve reads by colour, not by a pressed slab: the composer's tool
-   row stays flat, and the amber is the same warning colour the sidebar's ϟ
-   uses for a session that runs tools unattended. */
+/* An approval other than ask is amber: tools run unattended. */
 .approve-toggle {
   opacity: 0.7;
 }
 
-.approve-toggle:checked {
-  background-color: transparent;
-  box-shadow: none;
+.approve-toggle.unattended {
   color: @warning_color;
   opacity: 1;
-}
-
-.approve-toggle:checked:hover {
-  background-color: alpha(currentColor, 0.08);
 }
 
 /* AdwToggleGroup brings its own shape; only the web pill's type size and

@@ -79,8 +79,9 @@ describe('the app against a live usher', () => {
       win._pollId = 0;
     }
     api = win._api;
-    sessions = (await api.listSessions()).filter(s => !s.is_subagent);
-    if (sessions.length < 2) throw new Error('needs at least two sessions on the server');
+    // Archived sessions are folded away in the sidebar; these tests click rows.
+    sessions = (await api.listSessions()).filter(s => !s.subagent && !s.archived);
+    if (sessions.length < 2) throw new Error('needs at least two unarchived sessions on the server');
   });
 
   it('lists the server\'s sessions in the sidebar', () => {
@@ -339,7 +340,7 @@ describe('the app against a live usher', () => {
   });
 
   it('wears the chosen backend\'s colour on the config picker', () => {
-    win._modelCatalog = { backends: ['claude', 'codex'], models: {} };
+    win._backendCatalog = { backends: ['claude', 'codex'], models: {}, approvals: {} };
     win._newBackend = 'codex';
     win._syncNewConfig();
     expect(win._newConfig.has_css_class('backend-codex')).toBeTruthy();
@@ -348,6 +349,7 @@ describe('the app against a live usher', () => {
     win._syncNewConfig();
     expect(win._newConfig.has_css_class('backend-claude')).toBeTruthy();
     expect(win._newConfig.has_css_class('backend-codex')).toBeFalsy();
+    win._backendCatalog = null;
   });
 
   it('pins a size on the settings dialog', async () => {
@@ -372,10 +374,102 @@ describe('the app against a live usher', () => {
     win._renderRuntime({ model: 'sonnet', effort: 'high', context_tokens: 42000, context_window: 200000 });
     expect(win._usage.get_visible()).toBeTruthy();
     expect(win._usageFraction).toBe(0.21);
-    expect(win._usage.get_tooltip_text()).toBe('Context 21% used');
+    expect(win._usage.get_tooltip_text()).toBe('sonnet, high · Context 21% used');
     expect(labels(win._usageDetail)).toContain('sonnet');
     win._renderRuntime({ context_tokens: 0 });
     expect(win._usage.get_visible()).toBeFalsy();
+  });
+
+  it('switches the model and effort from the usage popover', async () => {
+    await win._selectSession(sessions[0].id);
+    const realCatalog = win._backendCatalog;
+    const realPatch = api.patchSession;
+    const patched = [];
+    api.patchSession = async (id, fields) => {
+      patched.push({ id, fields });
+      return { ...win._currentSession, runtime: { ...win._runtime, ...fields } };
+    };
+    try {
+      win._currentSession = { ...win._currentSession, backend: 'claude' };
+      win._backendCatalog = {
+        backends: ['claude'],
+        models: { claude: [
+          { id: 'opus', display_name: 'Opus', alias: true },
+          { id: 'claude-a', display_name: 'A', thinking_levels: ['low', 'high'] },
+          { id: 'claude-b', display_name: 'B', thinking_levels: ['high'] },
+        ] },
+        approvals: { claude: ['ask', 'auto', 'full'] },
+      };
+      win._runtimeKey = null;
+      win._renderRuntime({ model: 'claude-a', effort: 'low' });
+      const dropdowns = descend(win._usageDetail).filter(w => w instanceof Gtk.DropDown);
+      expect(dropdowns).toHaveLength(2);
+      // Aliases are left out; Claude can drop an effort switch.
+      expect(dropdowns[0].get_model().get_n_items()).toBe(2);
+      expect(dropdowns[1].get_model().get_string(0)).toBe('default');
+      dropdowns[0].set_selected(1);
+      await until('the model switch', () => patched.length === 1);
+      expect(patched[0].fields).toEqual({ model: 'claude-b' });
+    } finally {
+      api.patchSession = realPatch;
+      win._backendCatalog = realCatalog;
+      win._runtimeKey = null;
+    }
+  });
+
+  it('offers the backend\'s approvals and sets the session\'s', async () => {
+    win._backendCatalog = null;
+    await win._selectSession(sessions[0].id);
+    await until('the catalog', () => win._backendCatalog);
+    expect(win._approval.get_label()).toBe(`Approve: ${win._currentSession.approval || 'ask'}`);
+    const items = menuLabels(win._approval.get_menu_model());
+    expect(items.length).toBe(win._backendCatalog.approvals[win._currentSession.backend].length);
+    const realPatch = api.patchSession;
+    api.patchSession = async (_id, fields) => ({ ...win._currentSession, ...fields });
+    try {
+      win.activate_action('approval', GLib.Variant.new_string('full'));
+      await until('the approval to apply', () => win._currentSession.approval === 'full');
+      expect(win._approval.get_label()).toBe('Approve: full');
+      expect(win._approval.has_css_class('unattended')).toBeTruthy();
+    } finally {
+      api.patchSession = realPatch;
+      win._currentSession.approval = 'ask';
+      win._syncApproval();
+    }
+  });
+
+  it('starts a new session from the default agent', async () => {
+    await win._showNewSession();
+    await until('the catalogs to load', () => win._backendCatalog);
+    win._defaultAgent = { name: 'default', backend: 'codex', model: 'gpt-5.5', effort: 'high', approval: 'auto' };
+    win._backendCatalog = {
+      backends: ['claude', 'codex'],
+      models: { codex: [{ id: 'gpt-5.5', display_name: 'GPT-5.5', thinking_levels: ['low', 'high'] }] },
+      approvals: { claude: ['ask', 'auto', 'full'], codex: ['ask', 'full'] },
+    };
+    win._useNewDefaults();
+    expect([win._newBackend, win._newModel, win._newEffort]).toEqual(['codex', 'gpt-5.5', 'high']);
+    // codex here offers no auto, so the pick falls back to asking.
+    expect(win._approval.get_label()).toBe('Approve: ask');
+    const created = [];
+    const realCreate = api.createSession;
+    api.createSession = async request => { created.push(request); throw new Error('stubbed'); };
+    try {
+      win._newCwd.set_text('/tmp');
+      await win._createSession('hello');
+      expect(created[0]).toEqual({
+        initialMessage: 'hello', agent: '', cwd: '/tmp', backend: 'codex',
+        model: 'gpt-5.5', effort: 'high',
+      });
+    } finally {
+      api.createSession = realCreate;
+      win._backendCatalog = null;
+      await win._selectSession(sessions[0].id);
+    }
+  });
+
+  it('lists Details among the session actions', () => {
+    expect(menuLabels(win._sessionMenuModel(sessions[0]))).toContain('De_tails…');
   });
 });
 
@@ -404,6 +498,38 @@ describe('interaction cards', () => {
     const always = cards.permissionWidget(
       { id: 'p', kind: 'permission', tool_input: {}, allow_always: true }, 1);
     expect(buttonLabelled(always, 'Always allow')).toBeTruthy();
+  });
+
+  it('answers "always allow" with the always scope', () => {
+    answered.length = 0;
+    const card = cards.permissionWidget(
+      { id: 'p9', kind: 'permission', tool_input: {}, allow_always: true }, 1);
+    buttonLabelled(card, 'Always allow').emit('clicked');
+    expect(answered[0].payload.scope).toBe('always');
+  });
+
+  it('shows a permission\'s preview and reason instead of its raw input', () => {
+    const card = cards.permissionWidget({
+      id: 'p', kind: 'permission', tool_name: 'Bash', tool_input: { command: 'ls -la' },
+      reason: 'Needs a listing',
+      preview: { type: 'tool', tool_name: 'Bash', tool_target: 'List files', tool_input: 'ls -la' },
+    }, 1);
+    const shown = labels(card);
+    expect(shown).toContain('List files');
+    expect(shown).toContain('Needs a listing');
+    expect(shown).toContain('ls -la');
+    expect(shown.some(l => l.includes('"command"'))).toBeFalsy();
+  });
+
+  it('asks to leave plan mode with the plan shown', () => {
+    answered.length = 0;
+    const card = cards.permissionWidget({
+      id: 'plan1', kind: 'plan', preview: { type: 'tool', content: 'Step one' },
+    }, 1);
+    expect(labels(card)[0]).toBe('Plan');
+    buttonLabelled(card, 'Keep Planning').emit('clicked');
+    expect(answered[0].payload.behavior).toBe('deny');
+    expect(answered[0].payload.reason).toBe('The user wants to keep planning.');
   });
 
   it('walks a multi-question card one question at a time', async () => {

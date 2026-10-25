@@ -17,7 +17,7 @@ const event = await Promise.race([
   new Promise(resolve => {
     stream = new EventStream(
       client.session,
-      `${url}/api/sessions/${encodeURIComponent(sessions[0].id)}/events`,
+      client.eventsUrl(sessions[0].id),
       name => {
         if (name === 'turn.idle' || name === 'turn.active') resolve(name);
       }

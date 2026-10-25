@@ -4,6 +4,15 @@ import Soup from 'gi://Soup?version=3.0';
 
 import './promises.js';
 
+const API = '/api/v1';
+
+// usher answers { error: { code, message } }; anything else falls back to the
+// status.
+function errorMessage(payload, status) {
+  const error = payload?.error;
+  return error?.message || (typeof error === 'string' ? error : '') || `HTTP ${status}`;
+}
+
 export class ApiError extends Error {
   constructor(status, message) {
     super(message);
@@ -61,84 +70,92 @@ export class ApiClient {
 
   // Archived roots and read-only subagents come along; the sidebar decides
   // what to show, the way the web client does.
-  listSessions() {
-    return this.request('GET', '/api/sessions?include_archived=1&include_subagents=1');
+  async listSessions() {
+    const list = await this.request('GET', `${API}/sessions?include_archived=1&include_subagents=1`);
+    return list?.sessions || [];
   }
 
   // Every field but the message is optional; an agent profile supplies the
-  // defaults for whatever is left empty.
-  createSession({ cwd, initialMessage, model, backend, agent, autoApprove }) {
-    return this.request('POST', '/api/sessions', {
-      cwd: cwd || '',
-      initial_message: initialMessage || '',
-      model: model || '',
-      backend: backend || '',
-      agent: agent || '',
-      auto_approve: Boolean(autoApprove),
-    });
+  // defaults for whatever is left out.
+  createSession({ cwd, initialMessage, model, effort, backend, agent, approval }) {
+    const body = { initial_message: initialMessage || '' };
+    if (agent) body.agent = agent;
+    if (cwd !== undefined) body.cwd = cwd;
+    if (backend) body.backend = backend;
+    if (model) body.model = model;
+    if (effort) body.effort = effort;
+    if (approval) body.approval = approval;
+    return this.request('POST', `${API}/sessions`, body);
   }
 
-  // { backends: [name], models: { backend: [{id, display_name}] } }
-  listModels() {
-    return this.request('GET', '/api/models');
+  // { backends: [name], models: { backend: [{id, display_name, alias,
+  // thinking_levels}] }, approvals: { backend: [approval] } }
+  async listBackends() {
+    const list = (await this.request('GET', `${API}/backends`))?.backends || [];
+    return {
+      backends: list.map(b => b.name),
+      models: Object.fromEntries(list.map(b => [b.name, b.models || []])),
+      approvals: Object.fromEntries(list.map(b => [b.name, b.approvals || []])),
+    };
   }
 
-  // { editor_url } — the template for the session menu's editor entry.
+  // { editor_url, read_only, router: {session_id, dir} }
   getConfig() {
-    return this.request('GET', '/api/config');
+    return this.request('GET', '/internal/config');
   }
 
   // { source, available, commands: [{name, kind, description}] }. Only trust
   // commands when available is true; a backend that cannot answer says so
   // rather than reporting an empty catalog.
   listCommands(id) {
-    return this.request('GET', `/api/sessions/${encodeURIComponent(id)}/commands`);
+    return this.request('GET', `${API}/sessions/${encodeURIComponent(id)}/commands`);
   }
 
   // Starts an idle worker without adding a user turn.
   resumeSession(id) {
-    return this.request('POST', `/api/sessions/${encodeURIComponent(id)}/resume`);
+    return this.request('POST', `${API}/sessions/${encodeURIComponent(id)}/resume`);
   }
 
   listAgents() {
-    return this.request('GET', '/api/agents');
+    return this.request('GET', `${API}/agents`);
   }
 
   createAgent(profile) {
-    return this.request('POST', '/api/agents', profile);
+    return this.request('POST', `${API}/agents`, profile);
   }
 
   updateAgent(name, profile) {
-    return this.request('PUT', `/api/agents/${encodeURIComponent(name)}`, profile);
+    return this.request('PUT', `${API}/agents/${encodeURIComponent(name)}`, profile);
   }
 
+  // Deleting the default agent puts the built-in one back.
   deleteAgent(name) {
-    return this.request('DELETE', `/api/agents/${encodeURIComponent(name)}`);
+    return this.request('DELETE', `${API}/agents/${encodeURIComponent(name)}`);
   }
 
   // { schedules: [task + next_run], timezone }
   listSchedules() {
-    return this.request('GET', '/api/schedules');
+    return this.request('GET', `${API}/schedules`);
   }
 
   createSchedule(task) {
-    return this.request('POST', '/api/schedules', task);
+    return this.request('POST', `${API}/schedules`, task);
   }
 
   updateSchedule(id, task) {
-    return this.request('PUT', `/api/schedules/${encodeURIComponent(id)}`, task);
+    return this.request('PUT', `${API}/schedules/${encodeURIComponent(id)}`, task);
   }
 
   deleteSchedule(id) {
-    return this.request('DELETE', `/api/schedules/${encodeURIComponent(id)}`);
+    return this.request('DELETE', `${API}/schedules/${encodeURIComponent(id)}`);
   }
 
   runSchedule(id) {
-    return this.request('POST', `/api/schedules/${encodeURIComponent(id)}/run`);
+    return this.request('POST', `${API}/schedules/${encodeURIComponent(id)}/run`);
   }
 
   getSession(id) {
-    return this.request('GET', `/api/sessions/${encodeURIComponent(id)}`);
+    return this.request('GET', `${API}/sessions/${encodeURIComponent(id)}`);
   }
 
   // A page of a session's turns, oldest first: the newest `limit`, the page
@@ -148,26 +165,13 @@ export class ApiClient {
     const query = from
       ? `?from=${encodeURIComponent(from)}`
       : `?limit=${limit}` + (before ? `&before=${encodeURIComponent(before)}` : '');
-    const message = Soup.Message.new(
-      'GET',
-      `${this.baseUrl}/api/sessions/${encodeURIComponent(id)}/transcript${query}`
-    );
-    const bytes = await this._sendAndRead(message);
-    const text = new TextDecoder().decode(bytes.get_data());
-    let payload = null;
-    if (text) {
-      try { payload = JSON.parse(text); }
-      catch (_) { payload = text; }
-    }
-    if (message.status_code < 200 || message.status_code >= 300) {
-      const detail = payload?.error || `HTTP ${message.status_code}`;
-      throw new ApiError(message.status_code, detail);
-    }
-    return { turns: payload?.turns || [], more: Boolean(payload?.more) };
+    const page = await this.request(
+      'GET', `${API}/sessions/${encodeURIComponent(id)}/transcript${query}`);
+    return { turns: page?.turns || [], more: Boolean(page?.has_more) };
   }
 
   fork(id, afterUUID) {
-    return this.request('POST', `/api/sessions/${encodeURIComponent(id)}/fork`, { after_uuid: afterUUID });
+    return this.request('POST', `${API}/sessions/${encodeURIComponent(id)}/fork`, { after_uuid: afterUUID });
   }
 
   // Raw bytes of an image referenced by this session's transcript. The server
@@ -176,7 +180,7 @@ export class ApiClient {
   async imageBytes(id, path) {
     const message = Soup.Message.new(
       'GET',
-      `${this.baseUrl}/api/sessions/${encodeURIComponent(id)}/image` +
+      `${this.baseUrl}${API}/sessions/${encodeURIComponent(id)}/image` +
         `?path=${encodeURIComponent(path)}`
     );
     const bytes = await this._sendAndRead(message);
@@ -187,93 +191,73 @@ export class ApiClient {
   }
 
   send(id, text) {
-    return this.request('POST', `/api/sessions/${encodeURIComponent(id)}/send`, { text });
+    return this.request('POST', `${API}/sessions/${encodeURIComponent(id)}/messages`, { text });
   }
 
   cancel(id) {
-    return this.request('DELETE', `/api/sessions/${encodeURIComponent(id)}/send`);
+    return this.request('POST', `${API}/sessions/${encodeURIComponent(id)}/interrupt`);
+  }
+
+  // title, archived, pinned, approval, model, effort, extra_args; omitted
+  // fields stay as they are.
+  patchSession(id, fields) {
+    return this.request('PATCH', `${API}/sessions/${encodeURIComponent(id)}`, fields);
   }
 
   renameSession(id, title) {
-    return this.request('POST', `/api/sessions/${encodeURIComponent(id)}/rename`, { title });
+    return this.patchSession(id, { title });
   }
 
   setArchived(id, archived) {
-    return this.request(
-      archived ? 'POST' : 'DELETE',
-      `/api/sessions/${encodeURIComponent(id)}/archive`
-    );
+    return this.patchSession(id, { archived });
   }
 
   setPinned(id, pinned) {
-    return this.request(
-      pinned ? 'POST' : 'DELETE',
-      `/api/sessions/${encodeURIComponent(id)}/pin`
-    );
-  }
-
-  setAutoApprove(id, enabled) {
-    return this.request(
-      'POST',
-      `/api/sessions/${encodeURIComponent(id)}/auto-approve`,
-      { enabled }
-    );
+    return this.patchSession(id, { pinned });
   }
 
   // Uploads into a session's attachment directory, or — with a null id — into
   // the shared drafts directory, which is how a file can be attached to a
   // session that does not exist yet.
-  async upload(id, filename, contentType, bytes) {
-    const message = Soup.Message.new(
-      'POST',
-      id === null
-        ? `${this.baseUrl}/api/uploads`
-        : `${this.baseUrl}/api/sessions/${encodeURIComponent(id)}/upload`
-    );
-    const multipart = Soup.Multipart.new('multipart/form-data');
-    multipart.append_form_file('file', filename, contentType || null, bytes);
-    const body = multipart.to_message(message.request_headers);
-    // to_message already set Content-Type including the boundary parameter;
-    // passing a content type here would overwrite it with a bare one.
-    message.set_request_body_from_bytes(null, body);
-    const response = await this._sendAndRead(message);
-    const text = new TextDecoder().decode(response.get_data());
-    let payload = null;
-    if (text) {
-      try { payload = JSON.parse(text); }
-      catch (_) { payload = text; }
-    }
-    if (message.status_code < 200 || message.status_code >= 300) {
-      throw new ApiError(message.status_code, payload?.error || `HTTP ${message.status_code}`);
-    }
-    return payload;
+  upload(id, filename, contentType, bytes) {
+    const query = `?filename=${encodeURIComponent(filename)}` +
+      (id === null ? '' : `&session_id=${encodeURIComponent(id)}`);
+    return this.request('POST', `${API}/uploads${query}`, null, null,
+      { contentType: contentType || 'application/octet-stream', bytes });
   }
 
   pauseSession(id) {
-    return this.request('POST', `/api/sessions/${encodeURIComponent(id)}/pause`);
+    return this.request('POST', `${API}/sessions/${encodeURIComponent(id)}/pause`);
   }
 
-  listInteractions() {
-    return this.request('GET', '/api/interactions');
+  async listInteractions() {
+    return (await this.request('GET', `${API}/interactions`))?.interactions || [];
   }
 
-  // response: { behavior: 'allow'|'deny', scope?: 'once'|'session',
+  // response: { behavior: 'allow'|'deny', scope?: 'once'|'always',
   //             reason?: string, answers?: {question: label} }
   respondInteraction(id, response) {
     return this.request(
       'POST',
-      `/api/interactions/${encodeURIComponent(id)}/respond`,
+      `${API}/interactions/${encodeURIComponent(id)}/respond`,
       response
     );
   }
 
   deleteSession(id) {
-    return this.request('DELETE', `/api/sessions/${encodeURIComponent(id)}`);
+    return this.request('DELETE', `${API}/sessions/${encodeURIComponent(id)}`);
   }
 
-  async request(method, path, body = null, cancellable = null) {
+  eventsUrl(id) {
+    return `${this.baseUrl}${API}/sessions/${encodeURIComponent(id)}/events`;
+  }
+
+  // raw sends { contentType, bytes } as the body instead of JSON.
+  async request(method, path, body = null, cancellable = null, raw = null) {
     const message = Soup.Message.new(method, `${this.baseUrl}${path}`);
-    if (body !== null) {
+    if (raw) {
+      message.set_request_body_from_bytes(raw.contentType, raw.bytes);
+    } else if (body !== null) {
       const encoded = new TextEncoder().encode(JSON.stringify(body));
       message.set_request_body_from_bytes('application/json', new GLib.Bytes(encoded));
     }
@@ -287,8 +271,7 @@ export class ApiClient {
       catch (_) { payload = text; }
     }
     if (message.status_code < 200 || message.status_code >= 300) {
-      const detail = payload?.error || `HTTP ${message.status_code}`;
-      throw new ApiError(message.status_code, detail);
+      throw new ApiError(message.status_code, errorMessage(payload, message.status_code));
     }
     return payload;
   }
