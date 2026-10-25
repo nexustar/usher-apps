@@ -291,6 +291,13 @@ class UsherWindow extends Adw.ApplicationWindow {
     });
     this.add_action(groupBy);
     add('new-session', () => this._showNewSession());
+    const switchServer = new Gio.SimpleAction({
+      name: 'switch-server',
+      parameter_type: GLib.VariantType.new('s'),
+      state: GLib.Variant.new_string(''),
+    });
+    switchServer.connect('activate', (_action, parameter) => this._switchServer(parameter.get_string()[0]));
+    this.add_action(switchServer);
     add('search', () => {
       if (this._splitView.get_collapsed()) this._splitView.set_show_sidebar(true);
       this._searchToggle.set_active(true);
@@ -421,7 +428,22 @@ class UsherWindow extends Adw.ApplicationWindow {
 
     const sidebarToolbar = new Adw.ToolbarView();
     const sidebarHeader = new Adw.HeaderBar();
-    sidebarHeader.set_title_widget(new Adw.WindowTitle({ title: 'Sessions' }));
+    // The server in use, switched from here.
+    this._serverLabel = new Gtk.Label({
+      label: 'Sessions', ellipsize: Pango.EllipsizeMode.END, max_width_chars: 18,
+    });
+    this._serverLabel.add_css_class('heading');
+    const serverTitle = new Gtk.Box({ spacing: 4 });
+    serverTitle.append(this._serverLabel);
+    serverTitle.append(new Gtk.Image({ icon_name: 'pan-down-symbolic' }));
+    this._serverSwitcher = new Gtk.MenuButton({
+      child: serverTitle, tooltip_text: 'Switch server',
+    });
+    this._serverSwitcher.add_css_class('flat');
+    this._serverSwitcher.connect('notify::active', button => {
+      if (button.get_active()) this._syncServerSwitcher();
+    });
+    sidebarHeader.set_title_widget(this._serverSwitcher);
     const searchToggle = new Gtk.ToggleButton({
       icon_name: 'system-search-symbolic',
       tooltip_text: 'Search sessions',
@@ -444,7 +466,6 @@ class UsherWindow extends Adw.ApplicationWindow {
     // Server profiles are client-local and switching one changes what
     // Settings shows, so the two stay separate entries.
     appSection.append('New _Router Conversation', 'win.router-new');
-    appSection.append('_Servers…', 'win.servers');
     appSection.append('_Settings', 'win.settings');
     primaryMenu.append_section(null, appSection);
     sidebarHeader.pack_end(new Gtk.MenuButton({
@@ -799,6 +820,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._renderSessions(sessions || []);
       this._loadServerConfig();
       this._restoreLastSession();
+      this._syncServerSwitcher();
       this._startNotifications();
     } catch (error) {
       this._showError('Could not connect to usher', error);
@@ -2718,6 +2740,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._title.set_subtitle(serverConfig.name || this._backend.baseUrl);
       this._loadServerConfig();
       this._restoreLastSession();
+      this._syncServerSwitcher();
       this._startNotifications();
       return true;
     } catch (error) {
@@ -2783,6 +2806,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._backend.stop();
     this._currentServer = null;
     this._started = false;
+    this._syncServerSwitcher();
     this._selectedId = null;
     this._sidebar.sessionsDigest = null;
     this._sidebar.sessionsById = new Map();
@@ -2939,6 +2963,36 @@ class UsherWindow extends Adw.ApplicationWindow {
     }
     const adjustment = this._chatScroll.get_vadjustment();
     adjustment.set_value(Math.max(0, adjustment.get_upper() - adjustment.get_page_size()));
+  }
+
+  _syncServerSwitcher() {
+    const current = this._currentServer;
+    this._serverLabel.set_label(current?.name || 'Sessions');
+    const servers = new Gio.Menu();
+    if (this._servers.embeddedPath) servers.append('Embedded usher', 'win.switch-server::__embedded__');
+    for (const server of this._servers.servers) {
+      servers.append(server.name, `win.switch-server::${server.id}`);
+    }
+    const menu = new Gio.Menu();
+    menu.append_section(null, servers);
+    const manage = new Gio.Menu();
+    manage.append('_Manage Servers…', 'win.servers');
+    menu.append_section(null, manage);
+    this._serverSwitcher.set_menu_model(menu);
+    this.lookup_action('switch-server')?.set_state(
+      GLib.Variant.new_string(this._started ? current?.id || '' : ''));
+  }
+
+  async _switchServer(id) {
+    if (id === this._currentServer?.id && this._started) return;
+    const server = id === '__embedded__'
+      ? { id, name: 'Embedded usher', url: '', binaryPath: this._servers.embeddedPath,
+          port: this._servers.embeddedPort }
+      : this._servers.servers.find(s => s.id === id);
+    if (!server) return;
+    const result = await this._connectTo(server);
+    if (result === 'auth') this._promptPassword(server);
+    this._syncServerSwitcher();
   }
 
   // The session open last on each server comes back on the next start.

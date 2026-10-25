@@ -681,6 +681,12 @@ describe('the app against a live usher', () => {
     }
   });
 
+  it('names the server in the sidebar header and lists the others', () => {
+    win._syncServerSwitcher();
+    const labels = menuLabels(win._serverSwitcher.get_menu_model());
+    expect(labels).toContain('_Manage Servers…');
+  });
+
   it('lists Details among the session actions', () => {
     expect(menuLabels(win._sessionMenuModel(sessions[0]))).toContain('De_tails…');
   });
