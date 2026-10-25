@@ -20,6 +20,7 @@ install_data(
 install_data(
   'icons/hicolor/symbolic/apps/io.github.nexustar.Usher-send-symbolic.svg',
   'icons/hicolor/symbolic/apps/io.github.nexustar.Usher-dot-symbolic.svg',
+  'icons/hicolor/symbolic/apps/io.github.nexustar.Usher-router-symbolic.svg',
   install_dir: get_option('datadir') / 'icons/hicolor/symbolic/apps',
 )
 

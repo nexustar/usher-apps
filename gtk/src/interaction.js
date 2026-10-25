@@ -33,8 +33,9 @@ export class InteractionCards {
   }
 
   // The server's preview of the call, else its raw input.
-  permissionWidget(pending, total) {
-    if (pending.kind === 'plan') return this.planWidget(pending, total);
+  // source names the session a card comes from when it is not the open one.
+  permissionWidget(pending, total, source = '') {
+    if (pending.kind === 'plan') return this.planWidget(pending, total, source);
     const preview = pending.preview;
     const box = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6 });
     const heading = new Gtk.Label({
@@ -45,6 +46,7 @@ export class InteractionCards {
     });
     heading.add_css_class('heading');
     box.append(heading);
+    this._appendSource(box, source);
     if (preview?.tool_target) {
       const target = new Gtk.Label({
         label: ellipsize(preview.tool_target, 300),
@@ -113,13 +115,14 @@ export class InteractionCards {
   }
 
   // Approving a plan to leave plan mode.
-  planWidget(pending, total) {
+  planWidget(pending, total, source = '') {
     const box = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6 });
     const heading = new Gtk.Label({
       label: `Plan${total > 1 ? ` (1 of ${total})` : ''}`, xalign: 0,
     });
     heading.add_css_class('heading');
     box.append(heading);
+    this._appendSource(box, source);
     box.append(new Gtk.ScrolledWindow({
       child: markdown.render(pending.preview?.content || ''),
       hscrollbar_policy: Gtk.PolicyType.NEVER,
@@ -149,7 +152,7 @@ export class InteractionCards {
   // offered any) plus a free-text control that doubles as "Other" and is the
   // only control for a "text" interaction. Answers go back keyed by the
   // question text, verbatim from the tool input.
-  questionWidget(pending, queued) {
+  questionWidget(pending, queued, source = '') {
     const questions = pending.tool_input.questions;
     const answers = new Array(questions.length).fill('');
     let index = 0;
@@ -164,6 +167,7 @@ export class InteractionCards {
     position.add_css_class('dim-label');
     heading.append(position);
     box.append(heading);
+    this._appendSource(box, source);
     if (queued > 1) {
       const queuedLabel = new Gtk.Label({
         label: `${queued - 1} more waiting in this session`, xalign: 0,
@@ -339,6 +343,16 @@ export class InteractionCards {
 
     render();
     return box;
+  }
+
+  _appendSource(box, source) {
+    if (!source) return;
+    const label = new Gtk.Label({
+      label: `From ${source}`, xalign: 0, ellipsize: Pango.EllipsizeMode.END,
+    });
+    label.add_css_class('caption');
+    label.add_css_class('dim-label');
+    box.append(label);
   }
 
   singleLineAnswer(prefill, placeholder) {

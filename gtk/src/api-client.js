@@ -104,6 +104,21 @@ export class ApiClient {
     return this.request('GET', '/internal/config');
   }
 
+  // Replaces the current router conversation; answers the new session.
+  startRouter({ initialMessage, backend, model }) {
+    const body = { initial_message: initialMessage };
+    if (backend) body.backend = backend;
+    if (model) body.model = model;
+    return this.request('POST', '/internal/router', body);
+  }
+
+  // Replies to the work a session routed elsewhere, from cursor `from` on:
+  // [{turn, part, session_id, title, backend, status, reply, ts, done}].
+  routedReplies(id, from = '') {
+    return this.request('GET', `/internal/sessions/${encodeURIComponent(id)}/routed` +
+      (from ? `?from=${encodeURIComponent(from)}` : ''));
+  }
+
   // { source, available, commands: [{name, kind, description}] }. Only trust
   // commands when available is true; a backend that cannot answer says so
   // rather than reporting an empty catalog.

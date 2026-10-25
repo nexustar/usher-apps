@@ -42,8 +42,28 @@ class TranscriptImage extends Gtk.Picture {
   }
 });
 
+// The tools that hand work to another session.
+export const ROUTING_TOOL = /(^|__)(send_to_session|create_session)$/;
+// …and those that also move the router's focus.
+export const FOCUS_TOOL = /(^|__)(send_to_session|create_session|resolve_session)$/;
+
+// The target session id from a routing tool's result: create_session does
+// not know it when called.
+export function parseRoutedSession(content) {
+  if (!content) return '';
+  const a = content.indexOf('{');
+  const b = content.lastIndexOf('}');
+  if (a < 0 || b <= a) return '';
+  try {
+    const result = JSON.parse(content.slice(a, b + 1));
+    return typeof result.session_id === 'string' ? result.session_id : '';
+  } catch (_) {
+    return '';
+  }
+}
+
 // ctx: { window, api, sessionId(), backendName(), rawMarkdown(), onFork(uuid),
-//        onImageLoaded() }
+//        canFork(), onImageLoaded(), sessionTitle(id), openSession(id) }
 export class TranscriptView {
   constructor(ctx) {
     this._ctx = ctx;
@@ -95,7 +115,8 @@ export class TranscriptView {
   }
 
 
-  turnWidget(turn) {
+  // routed: replies to routed work, shown below the turn.
+  turnWidget(turn, routed = null) {
     const outer = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 4 });
     outer.set_margin_top(6);
     outer.set_margin_bottom(6);
@@ -150,7 +171,7 @@ export class TranscriptView {
       // timestamp nor a fork point yet.
       if (!turn.live) {
         const footer = this.turnFooter(turn.ts, false);
-        if (turn.uuid) footer.append(this.forkButton(turn.uuid));
+        if (turn.uuid && this._ctx.canFork?.() !== false) footer.append(this.forkButton(turn.uuid));
         if (footer.get_first_child()) outer.append(footer);
       }
     } else if (turn.role === 'error' ||
@@ -204,6 +225,7 @@ export class TranscriptView {
       const footer = this.turnFooter(turn.ts, true);
       if (footer.get_first_child()) outer.append(footer);
     }
+    for (const reply of routed || []) outer.append(this.routedReplyWidget(reply));
     return new Adw.Clamp({
       child: outer,
       maximum_size: 900,
@@ -211,7 +233,99 @@ export class TranscriptView {
     });
   }
 
+  routedReplyWidget(reply) {
+    // Full width, so a code block scrolls inside rather than spilling out.
+    const box = new Gtk.Box({
+      orientation: Gtk.Orientation.VERTICAL, spacing: 4,
+      margin_top: 6, margin_bottom: 6,
+    });
+    box.add_css_class('routed-reply');
+    const head = new Gtk.Box({ spacing: 6 });
+    const name = reply.title || `session ${reply.session_id.slice(0, 8)}`;
+    const source = new Gtk.Button({
+      child: new Gtk.Label({ label: name, ellipsize: Pango.EllipsizeMode.END, xalign: 0 }),
+      tooltip_text: `Open ${name}`,
+      hexpand: false,
+    });
+    source.add_css_class('flat');
+    source.add_css_class('routed-source');
+    if (reply.backend) source.add_css_class(`backend-${reply.backend}`);
+    source.connect('clicked', () => this._ctx.openSession?.(reply.session_id));
+    head.append(source);
+    const time = new Date(reply.ts || '');
+    if (reply.done && !Number.isNaN(time.getTime())) {
+      const stamp = new Gtk.Label({
+        label: `${time.getHours()}:${String(time.getMinutes()).padStart(2, '0')}`,
+        valign: Gtk.Align.CENTER,
+      });
+      stamp.add_css_class('caption');
+      stamp.add_css_class('dim-label');
+      head.append(stamp);
+    }
+    box.append(head);
+    if (!reply.done || !reply.reply) {
+      // Interrupted, tools only, or the prompt never arrived.
+      const state = new Gtk.Label({
+        label: !reply.done
+          ? (reply.status === 'awaiting_permission' ? 'Waiting for approval' : 'Working…')
+          : 'No reply',
+        xalign: 0,
+      });
+      state.add_css_class('caption');
+      state.add_css_class('dim-label');
+      box.append(state);
+    } else {
+      box.append(this.renderText(reply.reply));
+    }
+    return box;
+  }
+
+  routedPartWidget(part, id) {
+    let sent = '';
+    try {
+      const input = JSON.parse(part.tool_input || '{}');
+      sent = input.text || input.initial_message || '';
+    } catch (_) { /* no input recorded */ }
+    const title = this._ctx.sessionTitle?.(id) || id.slice(0, 8);
+    const header = new Gtk.Label({
+      label: `→ ${ellipsize(title, 120)}`,
+      tooltip_text: title,
+      xalign: 0,
+      ellipsize: Pango.EllipsizeMode.END,
+      hexpand: true,
+    });
+    header.add_css_class('tool-header');
+    const expander = new Gtk.Expander({ label_widget: header, hexpand: true });
+    expander.connect('notify::expanded', () => {
+      if (!expander.get_expanded() || expander.get_child() || !sent) return;
+      const body = new Gtk.Label({
+        label: sent, xalign: 0, wrap: true, selectable: true,
+        wrap_mode: Pango.WrapMode.WORD_CHAR,
+      });
+      body.add_css_class('tool-body');
+      expander.set_child(body);
+    });
+    const open = new Gtk.Button({
+      icon_name: 'go-next-symbolic',
+      tooltip_text: 'Open this session',
+      valign: Gtk.Align.START,
+    });
+    open.add_css_class('flat');
+    open.connect('clicked', () => this._ctx.openSession?.(id));
+    const row = new Gtk.Box({ spacing: 4 });
+    row.append(expander);
+    row.append(open);
+    const frame = new Gtk.Frame({ child: row, hexpand: true });
+    frame.add_css_class('routed-part');
+    return frame;
+  }
+
   toolWidget(part) {
+    // A rejected routing call carries no session id and stays a tool card.
+    if (ROUTING_TOOL.test(part.tool_name || '')) {
+      const id = parseRoutedSession(part.content);
+      if (id) return this.routedPartWidget(part, id);
+    }
     // show_image exists to put a picture in the transcript, so it renders as
     // one instead of a collapsible tool call.
     if (part.tool_target && /(^|__)show_image$/.test(part.tool_name || '')) {

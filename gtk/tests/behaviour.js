@@ -468,6 +468,74 @@ describe('the app against a live usher', () => {
     }
   });
 
+  it('opens the router conversation from the Router entry', async () => {
+    const config = await api.getConfig();
+    if (!config?.router?.session_id) return; // no router on this server
+    win._routerEntry.emit('row-activated', win._routerEntry.get_row_at_index(0));
+    await until('the router to open', () => win._selectedId === config.router.session_id &&
+      win._chatScroll.get_visible());
+    expect(win._title.get_title()).toBe('Router');
+    expect(win._routerEntry.get_selected_row()).toBeTruthy();
+    // No fork from the router: a branch of it would not be one.
+    expect(descend(win._messages).some(w => w.has_css_class?.('turn-fork'))).toBeFalsy();
+    const targets = [...win._routedTargets];
+    if (!targets.length) return; // it has routed nothing yet
+    // The focus is the session it handed work to last; the approval control
+    // is that session's.
+    expect(win._focusButton.get_visible()).toBeTruthy();
+    expect(targets).toContain(win._routerFocus);
+    expect(win._approval.get_visible()).toBeTruthy();
+    expect(win._approvalTarget().id).toBe(win._routerFocus);
+    await until('the replies to be placed', () => {
+      for (let i = 0; i < win._transcriptStore.get_n_items(); i++) {
+        if (win._transcriptStore.get_item(i).routed?.length) return true;
+      }
+      return false;
+    });
+    expect(descend(win._messages).some(w => w.has_css_class?.('routed-reply'))).toBeTruthy();
+    expect(descend(win._messages).some(w => w.has_css_class?.('routed-part'))).toBeTruthy();
+  });
+
+  it('answers a routed session\'s permission from the router, naming it', async () => {
+    if (!win._currentSession?.router || !win._routedTargets.size) return;
+    const target = [...win._routedTargets][0];
+    const realPending = win._pendingInteractions;
+    try {
+      win._interactionKey = null;
+      win._updateInteractions([{ id: 'routed-p', session_id: target, kind: 'permission', tool_input: {} }]);
+      expect(labels(win._permissionBox).some(l => l.startsWith('From '))).toBeTruthy();
+    } finally {
+      win._interactionKey = null;
+      win._updateInteractions(realPending);
+    }
+  });
+
+  it('starts a new router conversation on a chosen backend and model', async () => {
+    await win._showRouter(true);
+    await until('the backends', () => win._backendCatalog);
+    expect(win._newMode).toBeTruthy();
+    expect(win._newKind).toBe('router');
+    expect(win._newBar.get_visible()).toBeFalsy();
+    expect(win._upload.get_visible()).toBeFalsy();
+    expect(win._approval.get_visible()).toBeFalsy();
+    expect(win._routerEntry.get_selected_row()).toBeTruthy();
+    const started = [];
+    const realStart = api.startRouter;
+    api.startRouter = async request => { started.push(request); throw new Error('stubbed'); };
+    try {
+      win._prompt.get_buffer().set_text('route this', -1);
+      await win._sendMessage();
+      expect(started[0].initialMessage).toBe('route this');
+      expect(started[0].backend).toBe(win._newBackend);
+      expect(started[0].model).toBe(win._newModel);
+    } finally {
+      api.startRouter = realStart;
+      await win._selectSession(sessions[0].id);
+    }
+    expect(win._routerEntry.get_selected_row()).toBeFalsy();
+    expect(win._upload.get_visible()).toBeTruthy();
+  });
+
   it('lists Details among the session actions', () => {
     expect(menuLabels(win._sessionMenuModel(sessions[0]))).toContain('De_tails…');
   });

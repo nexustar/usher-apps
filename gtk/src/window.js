@@ -19,7 +19,7 @@ import { clearPassword, lookupPassword, storePassword } from './keyring.js';
 import { showSettingsDialog } from './settings.js';
 import { showSessionDetails } from './details.js';
 import { ellipsize } from './text.js';
-import { TranscriptView } from './transcript.js';
+import { FOCUS_TOOL, ROUTING_TOOL, TranscriptView, parseRoutedSession } from './transcript.js';
 
 Gio._promisify(Gtk.FileDialog.prototype, 'open', 'open_finish');
 
@@ -45,10 +45,13 @@ const isBusy = session => session.status === 'live' || session.status === 'runni
 
 const TranscriptItem = GObject.registerClass(
 class TranscriptItem extends GObject.Object {
-  _init(turn, key = '') {
+  // routed: replies to routed work shown below the turn.
+  _init(turn, key = '', routed = null) {
     super._init();
     this.turn = turn;
     this.key = key;
+    this.routed = routed;
+    this.routedSig = routed ? JSON.stringify(routed) : '';
     // Built on first bind and kept: GtkListView rebinds a row every time it
     // scrolls back into view, and building a turn costs a markdown parse. Any
     // change to a turn replaces its item, so the cache cannot go stale.
@@ -108,6 +111,18 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._previousStatus = new Map();
     this._rawMarkdown = false;
     this._optimisticTurn = null;
+    // The router session and directory, its last backend and model, and the
+    // open conversation's routed targets and focus.
+    this._routerId = '';
+    this._routerDir = '';
+    this._routerBackend = '';
+    this._routerModels = {};
+    this._newKind = 'session';
+    this._routedTargets = new Set();
+    this._routedTargetsKey = '';
+    this._routerFocus = '';
+    this._routedTitles = new Map();
+    this._routedTimer = 0;
 
     this._sidebar = new Sidebar({
       selectedId: () => this._selectedId,
@@ -117,6 +132,7 @@ class UsherWindow extends Adw.ApplicationWindow {
         this._pendingInteractions.filter(p => p.session_id === id).length,
       isUnread: id => this._unread.has(id),
       onContextMenu: (session, row, x, y) => this._showRowMenu(session, row, x, y),
+      routerDir: () => this._routerDir,
     });
     this._interactions = new InteractionCards({
       respond: (id, payload, buttons) => this._respondInteraction(id, payload, buttons),
@@ -128,7 +144,11 @@ class UsherWindow extends Adw.ApplicationWindow {
       backendName: () => this._currentSession?.backend || '',
       rawMarkdown: () => this._rawMarkdown,
       onFork: uuid => this._forkTurn(uuid),
+      canFork: () => !this._currentSession?.router,
       onImageLoaded: () => this._scrollToBottom(),
+      sessionTitle: id => this._sidebar.sessionsById?.get(id)?.title ||
+        this._routedTitles.get(id) || '',
+      openSession: id => this._openSession(id),
     });
 
     this._buildUi();
@@ -154,6 +174,8 @@ class UsherWindow extends Adw.ApplicationWindow {
     };
     add('settings', (_action, parameter) => this._showSettings(parameter?.get_string()[0]));
     add('servers', () => this._showConnectionDialog());
+    add('router', () => this._showRouter());
+    add('router-new', () => this._showRouter(true));
 
     // Per-session actions. Both menus that offer them — the sidebar's context
     // menu and the header's — name the session by setting _menuSession before
@@ -217,7 +239,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     choice('new-backend', value => {
       this._newBackend = value;
       // The previous model and effort belong to the previous backend.
-      this._newModel = 'default';
+      this._newModel = this._newKind === 'router' ? this._routerModel(value) : 'default';
       this._newEffort = '';
       this._syncNewConfig();
     });
@@ -279,6 +301,21 @@ class UsherWindow extends Adw.ApplicationWindow {
     const refresh = new Gtk.Button({ icon_name: 'view-refresh-symbolic', tooltip_text: 'Refresh' });
     refresh.set_action_name('app.refresh');
     header.pack_start(refresh);
+    // On the Router, the session it last handed work to.
+    // Elided, or a long title pushes the window title aside.
+    this._focusLabel = new Gtk.Label({
+      ellipsize: Pango.EllipsizeMode.END,
+      max_width_chars: 24,
+    });
+    this._focusButton = new Gtk.Button({
+      child: this._focusLabel, visible: false, valign: Gtk.Align.CENTER,
+    });
+    this._focusButton.add_css_class('flat');
+    this._focusButton.add_css_class('router-focus');
+    this._focusButton.connect('clicked', () => {
+      if (this._routerFocus) this._openSession(this._routerFocus);
+    });
+    header.pack_start(this._focusButton);
     this._connectionStatus = new Gtk.Image({
       icon_name: 'network-offline-symbolic',
       tooltip_text: 'Live updates disconnected; reconnecting…',
@@ -345,6 +382,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     const appSection = new Gio.Menu();
     // Server profiles are client-local and switching one changes what
     // Settings shows, so the two stay separate entries.
+    appSection.append('New _Router Conversation', 'win.router-new');
     appSection.append('_Servers…', 'win.servers');
     appSection.append('_Settings', 'win.settings');
     primaryMenu.append_section(null, appSection);
@@ -363,6 +401,14 @@ class UsherWindow extends Adw.ApplicationWindow {
     sidebarToolbar.add_top_bar(sidebarHeader);
     this._installWindowActions();
 
+    this._routerEntry = new Gtk.ListBox({ selection_mode: Gtk.SelectionMode.SINGLE });
+    this._routerEntry.add_css_class('navigation-sidebar');
+    const routerRow = new Gtk.Box({ spacing: 8 });
+    routerRow.append(new Gtk.Image({ icon_name: 'io.github.nexustar.Usher-router-symbolic' }));
+    routerRow.append(new Gtk.Label({ label: 'Router', xalign: 0, hexpand: true }));
+    this._routerEntry.append(routerRow);
+    this._routerEntry.connect('row-activated', () => this._showRouter());
+    sidebarBox.append(this._routerEntry);
     sidebarBox.append(this._sidebar.widget);
     sidebarToolbar.set_content(sidebarBox);
 
@@ -403,7 +449,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       listItem.set_activatable(false);
       listItem.set_selectable(false);
       const item = listItem.get_item();
-      if (!item.widget) item.widget = this._transcript.turnWidget(item.turn);
+      if (!item.widget) item.widget = this._transcript.turnWidget(item.turn, item.routed);
       listItem.set_child(item.widget);
     });
     transcriptFactory.connect('unbind', (_factory, listItem) => listItem.set_child(null));
@@ -705,13 +751,49 @@ class UsherWindow extends Adw.ApplicationWindow {
   // simply omits the editor entry.
   async _loadServerConfig() {
     const epoch = this._connectionEpoch;
+    let config = null;
     try {
-      const config = await this._api.getConfig();
-      if (this._connectionEpoch !== epoch) return;
-      this._editorURL = config?.editor_url || '';
+      config = await this._api.getConfig();
     } catch (_) {
-      this._editorURL = '';
+      // Defaults apply.
     }
+    if (this._connectionEpoch !== epoch) return null;
+    this._editorURL = config?.editor_url || '';
+    this._routerId = config?.router?.session_id || '';
+    const dir = config?.router?.dir || '';
+    if (dir !== this._routerDir) {
+      this._routerDir = dir;
+      this._sidebar.sessionsDigest = null; // the order changed, not a row
+      if (this._sidebar.sessionsById.size) {
+        this._renderSessions([...this._sidebar.sessionsById.values()]);
+      }
+    }
+    return config;
+  }
+
+  // The current router conversation, or a composer that starts one.
+  async _showRouter(fresh = false) {
+    const epoch = ++this._selectionEpoch;
+    await this._loadServerConfig();
+    if (this._selectionEpoch !== epoch) return; // the user went elsewhere meanwhile
+    if (!fresh && this._routerId) {
+      await this._openSession(this._routerId);
+      return;
+    }
+    await this._showNewSession('router');
+  }
+
+  async _openSession(id) {
+    await this._selectSession(id);
+    this._sidebar.selectSession(id);
+  }
+
+  _syncRouterEntry() {
+    const active = this._newMode ? this._newKind === 'router'
+      : Boolean(this._selectedId && this._currentSession?.router &&
+        this._currentSession.id === this._selectedId);
+    if (active) this._routerEntry.select_row(this._routerEntry.get_row_at_index(0));
+    else this._routerEntry.unselect_all();
   }
 
   async refresh() {
@@ -754,19 +836,26 @@ class UsherWindow extends Adw.ApplicationWindow {
   _renderSessions(sessions) {
     this._reconcileUnread(sessions);
     this._sidebar.render(sessions);
-    const selected = this._selectedId && this._sidebar.selectSession(this._selectedId);
-    if (!selected && this._selectedId) {
+    // A session folded out of sight stays open; only one that is gone closes.
+    if (this._selectedId) this._sidebar.selectSession(this._selectedId);
+    if (this._selectedId && !this._sidebar.sessionsById.has(this._selectedId)) {
       this._selectionEpoch++;
       this._selectedId = null;
       this._eventStream?.stop();
       this._status.set_title('Select a session');
       this._status.set_description('Choose a conversation from the sidebar.');
+      this._status.set_icon_name('utilities-terminal-symbolic');
       this._status.set_visible(true);
       this._chatScroll.set_visible(false);
       this._loadEarlier.set_visible(false);
       this._composer.set_visible(false);
     }
     this._syncSessionMenu();
+    this._syncRouterEntry();
+    if (this._currentSession?.router && !this._newMode) {
+      this._syncFocusButton();
+      this._syncApproval();
+    }
   }
 
   // Per-session actions on secondary click, the way a list of items is
@@ -847,6 +936,11 @@ class UsherWindow extends Adw.ApplicationWindow {
     main.append(isBusy(session) ? 'Pause _Worker' : 'Resume _Worker', 'win.session-worker');
     if (this._editorURL && session.cwd) main.append('Open in _Editor', 'win.session-editor');
     menu.append_section(null, main);
+    if (session.router) {
+      const router = new Gio.Menu();
+      router.append('New _Router Conversation', 'win.router-new');
+      menu.append_section(null, router);
+    }
     const destructive = new Gio.Menu();
     destructive.append('_Delete Permanently…', 'win.session-delete');
     menu.append_section(null, destructive);
@@ -943,12 +1037,16 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._chatScroll.set_visible(false);
     this._loadEarlier.set_visible(false);
     this._composer.set_visible(false);
+    this._status.set_icon_name('utilities-terminal-symbolic');
+    this._syncRouterEntry();
     if (this._splitView.get_collapsed()) this._splitView.set_show_sidebar(true);
   }
 
   // Takes over the conversation surface: the ordinary composer, plus the
-  // controls a session needs before it exists.
-  async _showNewSession() {
+  // controls a session needs before it exists, or for kind 'router' a backend
+  // and model.
+  async _showNewSession(kind = 'session') {
+    const router = kind === 'router';
     this._selectionEpoch++;
     this._selectedId = null;
     this._eventStream?.stop();
@@ -958,18 +1056,27 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._transcriptStore.remove_all();
     this._sidebar.unselectAll();
     this._newMode = true;
+    this._newKind = kind;
     this._newAgent = '';
     this._newBackend = '';
     this._newModel = '';
     this._newEffort = '';
     this._newApproval = '';
     this._currentSession = null;
+    this._routedTargets = new Set();
+    this._routedTargetsKey = '';
+    this._routerFocus = '';
+    this._syncFocusButton();
 
-    this._title.set_title('New session');
+    this._title.set_title(router ? 'Router' : 'New session');
     this._title.set_subtitle('');
-    this._status.set_title('New session');
-    this._status.set_description(
-      'Set a working directory, then write the first message.');
+    this._status.set_title(router ? 'Router' : 'New session');
+    this._status.set_description(router
+      ? 'Ask about your sessions, or hand one some work. The router finds, ' +
+        'opens and dispatches — the sessions do the work.'
+      : 'Set a working directory, then write the first message.');
+    this._status.set_icon_name(router
+      ? 'io.github.nexustar.Usher-router-symbolic' : 'utilities-terminal-symbolic');
     this._status.set_visible(true);
     this._chatScroll.set_visible(false);
     this._loadEarlier.set_visible(false);
@@ -978,14 +1085,28 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._interactionKey = null;
     this._updateInteractions(this._pendingInteractions);
     this._commands = [];
-    this._newBar.set_visible(true);
+    this._newBar.set_visible(!router);
     this._newConfig.set_visible(true);
+    this._upload.set_visible(!router);
     this._composer.set_visible(true);
     this._syncNewConfig();
     this._syncComposerActions();
+    this._syncRouterEntry();
     if (this._splitView.get_collapsed()) this._splitView.set_show_sidebar(false);
-    this._newCwdSuggestions.set_popover(this._cwdSuggestionPopover());
+    if (!router) this._newCwdSuggestions.set_popover(this._cwdSuggestionPopover());
     this._prompt.grab_focus();
+
+    if (router) {
+      this._backendCatalog = null;
+      const catalog = await this._loadBackendCatalog();
+      if (!this._newMode || this._newKind !== 'router') return;
+      const backends = catalog?.backends || [];
+      this._newBackend = backends.includes(this._routerBackend)
+        ? this._routerBackend : (backends[0] || '');
+      this._newModel = this._routerModel(this._newBackend);
+      this._syncNewConfig();
+      return;
+    }
 
     // The catalogs only decorate the picker; the view is usable (and the
     // request valid) with everything left at its default.
@@ -1009,9 +1130,20 @@ class UsherWindow extends Adw.ApplicationWindow {
     // draft, and this text was never one.
     this._prompt.get_buffer().set_text('', -1);
     this._newMode = false;
+    this._newKind = 'session';
     this._newBar.set_visible(false);
     this._newConfig.set_visible(false);
+    this._upload.set_visible(true);
     this._newCwd.set_text('');
+  }
+
+  // The model the router last started on with this backend, or the catalog's
+  // first.
+  _routerModel(backend) {
+    const models = this._backendCatalog?.models?.[backend] || [];
+    const saved = this._routerModels[backend];
+    if (saved && (saved === 'default' || models.some(m => m.id === saved))) return saved;
+    return models[0]?.id || 'default';
   }
 
   // Directories already in the session list are the ones worth offering.
@@ -1049,6 +1181,10 @@ class UsherWindow extends Adw.ApplicationWindow {
   // top-level radio items (the common choice); backend, model and effort are
   // submenus, because each list depends on the choice before it.
   _syncNewConfig() {
+    if (this._newKind === 'router') {
+      this._syncRouterConfig();
+      return;
+    }
     const catalog = this._backendCatalog;
     const backend = this._newBackend;
     const backends = [...(catalog?.backends || [])];
@@ -1109,6 +1245,56 @@ class UsherWindow extends Adw.ApplicationWindow {
     if (BACKENDS.includes(backend)) this._newConfig.add_css_class(`backend-${backend}`);
     this._title.set_subtitle(this._newAgent ? `agent: ${this._newAgent}` : '');
     this._syncApproval();
+  }
+
+  _syncRouterConfig() {
+    const catalog = this._backendCatalog;
+    const backend = this._newBackend;
+    const models = catalog?.models?.[backend] || [];
+    const menu = new Gio.Menu();
+    const backendMenu = new Gio.Menu();
+    for (const name of catalog?.backends || []) {
+      backendMenu.append(name, `win.new-backend::${name}`);
+    }
+    menu.append_submenu('Backend', backendMenu);
+    const modelMenu = new Gio.Menu();
+    for (const model of models.length ? models : [{ id: 'default', display_name: 'Default' }]) {
+      modelMenu.append(model.display_name || model.id, `win.new-model::${model.id}`);
+    }
+    menu.append_submenu('Model', modelMenu);
+    this._newConfig.set_menu_model(catalog?.backends?.length ? menu : null);
+    this.lookup_action('new-backend')?.set_state(GLib.Variant.new_string(backend));
+    this.lookup_action('new-model')?.set_state(GLib.Variant.new_string(this._newModel));
+    const modelLabel = models.find(m => m.id === this._newModel)?.display_name ||
+      (this._newModel === 'default' ? 'Default' : this._newModel);
+    this._newConfig.set_label(ellipsize(
+      [backend, modelLabel].filter(Boolean).join(' · ') || 'Default', 28));
+    for (const name of BACKENDS) this._newConfig.remove_css_class(`backend-${name}`);
+    if (BACKENDS.includes(backend)) this._newConfig.add_css_class(`backend-${backend}`);
+    this._syncApproval();
+  }
+
+  async _startRouter(text) {
+    const backend = this._newBackend;
+    const model = this._newModel;
+    this._sendInFlight = true;
+    this._syncComposerActions();
+    try {
+      const result = await this._api.startRouter({ initialMessage: text, backend, model });
+      if (backend) {
+        this._routerBackend = backend;
+        this._routerModels[backend] = model;
+      }
+      this._routerId = result.id;
+      this._leaveNewSession();
+      await this.refreshSessions();
+      await this._openSession(result.id);
+    } catch (error) {
+      this._showToast(error.message || String(error));
+    } finally {
+      this._sendInFlight = false;
+      this._syncComposerActions();
+    }
   }
 
   // Custom starts from the default agent (Settings → Agents).
@@ -1218,6 +1404,10 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._liveTurn = null;
     this._renderedTurns = [];
     this._sendInFlight = false;
+    this._routedTargets = new Set();
+    this._routedTargetsKey = '';
+    this._routerFocus = '';
+    this._syncFocusButton();
     this._transcriptStore.remove_all();
     this._setTurnRunning(false);
     this._hasEarlier = false;
@@ -1232,9 +1422,9 @@ class UsherWindow extends Adw.ApplicationWindow {
     try {
       const session = await this._api.getSession(id);
       if (this._selectionEpoch !== epoch || this._selectedId !== id) return;
-      this._title.set_title(session.title || '(untitled)');
-      this._title.set_subtitle(ellipsize(`${session.backend} · ${session.cwd}`, 200));
       this._currentSession = session;
+      this._setSessionTitle(session);
+      this._syncRouterEntry();
       this._syncApproval();
       this._runtimeKey = null;
       this._renderRuntime(session.runtime);
@@ -1268,10 +1458,11 @@ class UsherWindow extends Adw.ApplicationWindow {
   // "choice" and "text" are answered by picking or typing. One of each can be
   // pending at once. The keyed comparison skips rebuilds, or a poll would yank
   // buttons out from under a click and clear half-typed answers.
+  // Sessions this one routed work to are included.
   _updateInteractions(list) {
     this._pendingInteractions = list;
     const mine = this._selectedId
-      ? list.filter(p => p.session_id === this._selectedId)
+      ? list.filter(p => p.session_id === this._selectedId || this._routedTargets.has(p.session_id))
       : [];
     const permissions = mine.filter(p => !this._interactions.isQuestion(p));
     const questions = mine.filter(p => this._interactions.isQuestion(p));
@@ -1287,13 +1478,22 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._permissionBox.set_visible(true);
     if (permissions.length) {
       this._permissionBox.append(this._interactions.interactionCard(
-        this._interactions.permissionWidget(permissions[0], permissions.length)));
+        this._interactions.permissionWidget(
+          permissions[0], permissions.length, this._interactionSource(permissions[0]))));
     }
     if (questions.length) {
       this._permissionBox.append(this._interactions.interactionCard(
-        this._interactions.questionWidget(questions[0], questions.length)));
+        this._interactions.questionWidget(
+          questions[0], questions.length, this._interactionSource(questions[0]))));
     }
     this._scrollToBottom();
+  }
+
+  _interactionSource(pending) {
+    if (!pending.session_id || pending.session_id === this._selectedId) return '';
+    return this._sidebar.sessionsById?.get(pending.session_id)?.title ||
+      this._routedTitles.get(pending.session_id) ||
+      `session ${pending.session_id.slice(0, 8)}`;
   }
 
   async _respondInteraction(id, payload, buttons) {
@@ -1591,13 +1791,23 @@ class UsherWindow extends Adw.ApplicationWindow {
     return `${(count / 1000000).toFixed(1)}m`.replace('.0', '');
   }
 
+  // The session the approval control acts on: the open one, or on the Router
+  // the session it last handed work to. Null when there is none.
+  _approvalTarget() {
+    const session = this._currentSession;
+    if (this._newMode || !session) return null;
+    if (!session.router) return session;
+    if (!this._routerFocus) return null;
+    return this._sidebar.sessionsById?.get(this._routerFocus) || { id: this._routerFocus };
+  }
+
   // In the new-session view, the approval the session will be created with.
   _currentApproval() {
-    return (this._newMode ? this._newApproval : this._currentSession?.approval) || 'ask';
+    return (this._newMode ? this._newApproval : this._approvalTarget()?.approval) || 'ask';
   }
 
   _approvalChoices() {
-    const backend = this._newMode ? this._newBackend : this._currentSession?.backend;
+    const backend = this._newMode ? this._newBackend : this._approvalTarget()?.backend;
     const listed = this._backendCatalog?.approvals?.[backend];
     return listed?.length ? listed : (this._newMode ? Object.keys(APPROVALS) : []);
   }
@@ -1608,6 +1818,12 @@ class UsherWindow extends Adw.ApplicationWindow {
         !this._approvalChoices().includes(this._newApproval)) {
       this._newApproval = '';
     }
+    // Hidden for a new router conversation, and on the Router without a focus.
+    const target = this._approvalTarget();
+    this._approval.set_visible(this._newMode ? this._newKind !== 'router' : Boolean(target));
+    this._approval.set_tooltip_text(target && target !== this._currentSession
+      ? `Who answers the approval requests of the current session (${target.id.slice(0, 8)})`
+      : 'Who answers the agent’s approval requests');
     const current = this._currentApproval();
     const choices = this._approvalChoices();
     const menu = new Gio.Menu();
@@ -1630,17 +1846,124 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._syncApproval();
       return;
     }
-    const session = this._currentSession;
-    if (!session || session.id !== this._selectedId) return;
+    const target = this._approvalTarget();
+    if (!target) return;
     this._approval.set_sensitive(false);
     try {
-      const updated = await this._api.patchSession(session.id, { approval });
-      session.approval = updated?.approval || approval;
+      const updated = await this._api.patchSession(target.id, { approval });
+      target.approval = updated?.approval || approval;
+      if (target !== this._currentSession) this.refreshSessions();
     } catch (error) {
       this._showToast(`Approval update failed: ${error.message || error}`);
     } finally {
       this._approval.set_sensitive(true);
-      if (this._currentSession === session) this._syncApproval();
+      this._syncApproval();
+    }
+  }
+
+  _setSessionTitle(session) {
+    this._title.set_title(session.router ? 'Router' : (session.title || '(untitled)'));
+    this._title.set_subtitle(ellipsize(session.router
+      ? session.backend : `${session.backend} · ${session.cwd}`, 200));
+  }
+
+  _syncFocusButton() {
+    const id = this._currentSession?.router && !this._newMode ? this._routerFocus : '';
+    this._focusButton.set_visible(Boolean(id));
+    if (!id) return;
+    const title = this._sidebar.sessionsById?.get(id)?.title || this._routedTitles.get(id) || '';
+    this._focusLabel.set_label(`Focus: ${title || id.slice(0, 8)}`);
+    this._focusButton.set_tooltip_text(
+      `The session the Router last handed work to${title ? ` — ${title}` : ''}`);
+  }
+
+  // The sessions this conversation routed work to, and on the Router the
+  // last one it sent work to, created or resolved.
+  _syncRouterFocus() {
+    const turns = this._renderedTurns.map(entry => entry.turn);
+    if (this._liveTurn) turns.push(this._liveTurn);
+    const targets = new Set();
+    let focus = '';
+    for (const turn of turns) {
+      for (const part of turn.parts || []) {
+        if (part.type !== 'tool') continue;
+        const name = part.tool_name || '';
+        if (ROUTING_TOOL.test(name)) {
+          const target = parseRoutedSession(part.content);
+          if (target) targets.add(target);
+        }
+        if (!part.tool_error && FOCUS_TOOL.test(name)) {
+          focus = parseRoutedSession(part.content) || focus;
+        }
+      }
+    }
+    this._routerFocus = this._currentSession?.router ? focus : '';
+    const key = [...targets].join(',');
+    if (key !== this._routedTargetsKey) {
+      this._routedTargets = targets;
+      this._routedTargetsKey = key;
+      this._interactionKey = null;
+      this._updateInteractions(this._pendingInteractions);
+    }
+    this._syncFocusButton();
+    this._syncApproval();
+  }
+
+  // Nothing announces a reply that was not relayed, so pending ones are
+  // polled.
+  async _syncRouted(id, epoch = this._selectionEpoch) {
+    if (this._routedTimer) {
+      GLib.source_remove(this._routedTimer);
+      this._routedTimer = 0;
+    }
+    const stale = () => this._selectionEpoch !== epoch || this._selectedId !== id;
+    if (stale()) return;
+    this._syncRouterFocus();
+    const routes = this._renderedTurns.some(entry => (entry.turn.parts || [])
+      .some(part => part.type === 'tool' && ROUTING_TOOL.test(part.tool_name || '')));
+    let replies = [];
+    if (routes) {
+      const first = this._renderedTurns.find(entry => entry.turn.cursor)?.turn.cursor || '';
+      try {
+        replies = await this._api.routedReplies(id, first) || [];
+      } catch (_) {
+        return;
+      }
+      if (stale()) return;
+    }
+    // A finished reply goes where it landed: after the last turn that began
+    // before it. One still in flight stays under its dispatch.
+    const placed = new Map();
+    for (const reply of replies) {
+      if (reply.title) this._routedTitles.set(reply.session_id, reply.title);
+      const at = this._renderedTurns.findIndex(entry => entry.turn.cursor === reply.turn);
+      if (at < 0) continue;
+      let index = at;
+      if (reply.done && reply.ts) {
+        const landed = Date.parse(reply.ts) || 0;
+        const later = this._renderedTurns.findIndex((entry, i) =>
+          i > at && (Date.parse(entry.turn.ts || '') || 0) > landed);
+        index = later < 0 ? this._renderedTurns.length - 1 : later - 1;
+      }
+      if (!placed.has(index)) placed.set(index, []);
+      placed.get(index).push(reply);
+    }
+    this._growTranscript(() => {
+      for (let i = 0; i < this._renderedTurns.length; i++) {
+        const routed = placed.get(i) || null;
+        const item = this._transcriptStore.get_item(i);
+        if ((item?.routedSig || '') === (routed ? JSON.stringify(routed) : '')) continue;
+        const entry = this._renderedTurns[i];
+        this._transcriptStore.splice(i, 1, [new TranscriptItem(entry.turn, entry.key, routed)]);
+      }
+    });
+    this._syncFocusButton();
+    if (replies.some(reply => !reply.done)) {
+      this._routedTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 4000, () => {
+        this._routedTimer = 0;
+        this._syncRouted(id, epoch);
+        return GLib.SOURCE_REMOVE;
+      });
     }
   }
 
@@ -1714,6 +2037,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     for (let i = common; i < incoming.length; i++) this._renderedTurns.push(incoming[i]);
     this._scrollToBottom(initialLoad);
     this._loadEarlier.set_visible(this._hasEarlier);
+    this._syncRouted(id, epoch);
     return true;
   }
 
@@ -1736,6 +2060,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._transcriptStore.splice(
         0, 0, entries.map(e => new TranscriptItem(e.turn, e.key)));
       this._renderedTurns.unshift(...entries);
+      this._syncRouted(id, epoch);
       // Put the turn that was at the top back at the top, so the inserted
       // history does not yank the reader.
       this._messages.scroll_to(entries.length, Gtk.ListScrollFlags.NONE, null);
@@ -1830,7 +2155,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       const session = await this._api.getSession(id);
       if (this._selectionEpoch !== epoch || this._selectedId !== id) return;
       this._currentSession = session;
-      this._title.set_title(session.title || '(untitled)');
+      this._setSessionTitle(session);
       this._syncApproval();
       this._renderRuntime(session.runtime);
     } catch (_) {
@@ -1869,7 +2194,9 @@ class UsherWindow extends Adw.ApplicationWindow {
       const buffer = this._prompt.get_buffer();
       const text = buffer.get_text(
         buffer.get_start_iter(), buffer.get_end_iter(), false).trim();
-      if (text) await this._createSession(text);
+      if (!text) return;
+      if (this._newKind === 'router') await this._startRouter(text);
+      else await this._createSession(text);
       return;
     }
     if (!this._selectedId) return;
@@ -2324,8 +2651,8 @@ class UsherWindow extends Adw.ApplicationWindow {
   // new render mode. One splice rather than a remove and an append per turn:
   // each of those is an items-changed the list view has to answer.
   _rerenderTranscript() {
-    const items = this._renderedTurns
-      .map(item => new TranscriptItem(item.turn, item.key));
+    const items = this._renderedTurns.map((item, i) => new TranscriptItem(
+      item.turn, item.key, this._transcriptStore.get_item(i)?.routed));
     if (this._optimisticTurn) {
       items.push(new TranscriptItem(this._optimisticTurn, '__optimistic__'));
     }
@@ -2368,6 +2695,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     if (part.type !== 'tool' && !part.content) return;
     this._beginLiveTurn();
     this._liveTurn.parts.push(part);
+    if (part.type === 'tool' && FOCUS_TOOL.test(part.tool_name || '')) this._syncRouterFocus();
     if (part.type === 'tool') {
       this._liveTurn.acceptDeltas = true; // a later text item starts a new preview
     } else {

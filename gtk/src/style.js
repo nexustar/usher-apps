@@ -52,6 +52,26 @@ const CSS = `
   color: @warning_color;
 }
 
+/* Routed work and its replies. */
+.routed-part {
+  border-radius: 12px;
+  margin-top: 4px;
+  margin-bottom: 4px;
+}
+
+.routed-reply {
+  background-color: alpha(currentColor, 0.04);
+  border: 1px solid alpha(currentColor, 0.12);
+  border-radius: 14px;
+  padding: 8px 12px;
+}
+
+.routed-source {
+  font-weight: 600;
+  padding: 0 4px;
+  min-height: 0;
+}
+
 /* Tool calls recede into the background: an outline and nothing else, which
    is what the web settled on — they are scaffolding, not content. */
 .tool-card {

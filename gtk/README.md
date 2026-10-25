@@ -12,6 +12,10 @@ A native GTK 4/libadwaita client written in GJS. The current MVP provides:
   file before the session exists;
 - backend slash-command completion in the composer, and context usage beside
   send, whose popover also switches the session's model and effort;
+- the Router: usher's router conversation from the top of the sidebar (or a
+  new one on a chosen backend and model), with the session it last handed
+  work to in the header, the replies of routed sessions shown where they
+  landed, and their permission requests answered from there;
 - a per-session approval menu (ask / auto / full, as the backend offers) and
   a Details dialog that edits the session's extra CLI flags;
 - native transcript rendering, including collapsible tool calls and inline

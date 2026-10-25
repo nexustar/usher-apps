@@ -56,7 +56,7 @@ class SidebarItem extends GObject.Object {
 });
 
 // ctx: { selectedId(), searchQuery(), onSelect(id), onContextMenu(),
-//        interactionCount(id), isUnread(id) }
+//        interactionCount(id), isUnread(id), routerDir() }
 export class Sidebar {
   constructor(ctx) {
     this._ctx = ctx;
@@ -369,7 +369,12 @@ export class Sidebar {
       if (a.pinned && b.pinned) return recent(b) - recent(a);
       const ac = a.cwd || '(unknown)';
       const bc = b.cwd || '(unknown)';
-      if (ac !== bc) return (groupRecent.get(bc) || 0) - (groupRecent.get(ac) || 0);
+      if (ac !== bc) {
+        // The router's own directory comes last, whatever its activity.
+        const routerDir = this._ctx.routerDir?.() || '';
+        if ((ac === routerDir) !== (bc === routerDir)) return ac === routerDir ? 1 : -1;
+        return (groupRecent.get(bc) || 0) - (groupRecent.get(ac) || 0);
+      }
       // Archived sessions sit at the end of their group, which is what
       // paging them in from the bottom relies on.
       if (!!a.archived !== !!b.archived) return a.archived ? 1 : -1;
