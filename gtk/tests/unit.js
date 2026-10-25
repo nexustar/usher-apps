@@ -5,6 +5,8 @@ import GLib from 'gi://GLib';
 import { describe, it, expect, run } from './harness.js';
 import { fileRef } from '../src/window.js';
 import { ellipsize, formatArgs, parseArgs } from '../src/text.js';
+import { dateBucket } from '../src/sidebar.js';
+import { isClosedFence, resolveColors } from '../src/diagram.js';
 
 GLib.setenv('XDG_CONFIG_HOME', GLib.dir_make_tmp('usher-unit-XXXXXX'), true);
 const { DEFAULT_EMBEDDED_PORT, ServerStore } = await import('../src/server-store.js');
@@ -21,6 +23,41 @@ describe('ellipsize', () => {
 
   it('survives a missing value', () => {
     expect(ellipsize(null, 5)).toBe('');
+  });
+});
+
+describe('date groups', () => {
+  const now = new Date(2026, 9, 25, 15, 0);
+  const at = (d, h = 12) => new Date(2026, 9, d, h).getTime();
+  it('buckets by days before today\'s midnight', () => {
+    expect(dateBucket(at(25, 1), now)).toBe('Today');
+    expect(dateBucket(at(24, 23), now)).toBe('Yesterday');
+    expect(dateBucket(at(19), now)).toBe('Previous 7 days');
+    expect(dateBucket(at(1), now)).toBe('Previous 30 days');
+    expect(dateBucket(new Date(2026, 5, 1).getTime(), now)).toBe('Older');
+  });
+});
+
+describe('diagram colours', () => {
+  const svg = '<svg viewBox="0 0 1 1" style="--_bg:var(--pele-bg,#fff);--_a:var(--pele-surface-alt,#e6e6e6);--_r:var(--pele-radius,4px)">' +
+    '<rect fill="var(--_bg)" style="rx:var(--_r)"/><rect fill="color-mix(in srgb,var(--_a) 50%,var(--_bg))"/>' +
+    '<g fill="var(--pele-series-1,#123456)"/></svg>';
+
+  it('resolves theme colours, declared variables and fallbacks', () => {
+    const out = resolveColors(svg, { 'pele-bg': '#000000' });
+    expect(out.includes('var(')).toBeFalsy();
+    expect(out).toContain('<rect fill="#000000" rx="4"/>');
+    expect(out).toContain('fill="#123456"');
+  });
+
+  it('mixes colours librsvg cannot', () => {
+    const out = resolveColors(svg, { 'pele-bg': '#000000', 'pele-surface-alt': '#ffffff' });
+    expect(out).toContain('fill="rgb(128,128,128)"');
+  });
+
+  it('draws only a closed fence', () => {
+    expect(isClosedFence('```mermaid\ngraph LR\n```')).toBeTruthy();
+    expect(isClosedFence('```mermaid\ngraph LR\n')).toBeFalsy();
   });
 });
 

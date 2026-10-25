@@ -4,7 +4,8 @@ A native GTK 4/libadwaita client written in GJS. The current MVP provides:
 
 - multiple switchable local or remote usher server profiles;
 - optional startup of a specifically configured local usher binary;
-- session discovery, filtering, and metadata, kept fresh by a background poll;
+- session discovery, filtering, and metadata, kept fresh by a background poll,
+  grouped by directory or by date;
 - a settings dialog (`Ctrl+,`) for the connected server's agent profiles and
   scheduled tasks;
 - backend, model, effort, approval and agent selection when creating a
@@ -18,8 +19,10 @@ A native GTK 4/libadwaita client written in GJS. The current MVP provides:
   landed, and their permission requests answered from there;
 - a per-session approval menu (ask / auto / full, as the backend offers) and
   a Details dialog that edits the session's extra CLI flags;
-- native transcript rendering, including collapsible tool calls and inline
-  images (click one to open it full size);
+- native transcript rendering, including collapsible tool calls, inline
+  images (click one to open it full size), mermaid diagrams (drawn with the
+  vendored pele, as the web client does) and session ids linked to their
+  sessions;
 - responsive libadwaita navigation that collapses the session sidebar on narrow windows;
 - message sending and SSE-driven live refresh, including streamed text previews;
 - tool permission requests (with the server's preview of the call), plan

@@ -2,6 +2,7 @@ import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk?version=4.0';
 import Pango from 'gi://Pango';
 
+import * as diagram from './diagram.js';
 import './vendor/marked.umd.js';
 
 
@@ -18,20 +19,47 @@ function safeHref(href) {
   return ['http', 'https', 'mailto'].includes(scheme) ? value : '';
 }
 
-function inline(tokens = []) {
+// A session id, whole or as its first eight characters.
+const SESSION_REF = /\b[0-9a-f]{8}(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\b/g;
+const SESSION_SCHEME = 'usher-session:';
+
+// resolveSession(ref) → {id, title} or null; openSession(id).
+let sessionLinks = null;
+export function setSessionLinks(links) {
+  sessionLinks = links;
+}
+
+// Escapes text, linking the session ids that resolve to one session.
+function linkSessions(text, inLink) {
+  const value = String(text ?? '');
+  if (inLink || !sessionLinks || value.search(SESSION_REF) < 0) return escape(value);
+  let out = '';
+  let last = 0;
+  for (const match of value.matchAll(SESSION_REF)) {
+    const session = sessionLinks.resolveSession(match[0]);
+    if (!session) continue;
+    out += escape(value.slice(last, match.index));
+    const title = session.title ? ` title="${escape(session.title)}"` : '';
+    out += `<a href="${SESSION_SCHEME}${escape(session.id)}"${title}>${escape(match[0])}</a>`;
+    last = match.index + match[0].length;
+  }
+  return out + escape(value.slice(last));
+}
+
+function inline(tokens = [], inLink = false) {
   return tokens.map(token => {
     switch (token.type) {
       case 'text':
       case 'escape':
-        return token.tokens ? inline(token.tokens) : escape(token.text);
-      case 'strong': return `<b>${inline(token.tokens)}</b>`;
-      case 'em': return `<i>${inline(token.tokens)}</i>`;
+        return token.tokens ? inline(token.tokens, inLink) : linkSessions(token.text, inLink);
+      case 'strong': return `<b>${inline(token.tokens, inLink)}</b>`;
+      case 'em': return `<i>${inline(token.tokens, inLink)}</i>`;
       case 'codespan':
-        return `<span font_family="monospace" background="#bbbbbb2e"> ${escape(token.text)} </span>`;
-      case 'del': return `<s>${inline(token.tokens)}</s>`;
+        return `<span font_family="monospace" background="#bbbbbb2e"> ${linkSessions(token.text, inLink)} </span>`;
+      case 'del': return `<s>${inline(token.tokens, inLink)}</s>`;
       case 'br': return '\n';
       case 'link': {
-        const label = inline(token.tokens);
+        const label = inline(token.tokens, true);
         const href = safeHref(token.href);
         return href ? `<a href="${escape(href)}">${label}</a>` : label;
       }
@@ -42,9 +70,16 @@ function inline(tokens = []) {
       }
       case 'html': return escape(token.raw || token.text);
       default:
-        return token.tokens ? inline(token.tokens) : escape(token.text || token.raw);
+        return token.tokens ? inline(token.tokens, inLink) : escape(token.text || token.raw);
     }
   }).join('');
+}
+
+// Session links open in the app; others go to the system's handler.
+function onActivateLink(_label, uri) {
+  if (!uri.startsWith(SESSION_SCHEME)) return false;
+  sessionLinks?.openSession(uri.slice(SESSION_SCHEME.length));
+  return true;
 }
 
 function labelFor(token, extra = {}) {
@@ -61,6 +96,7 @@ function labelFor(token, extra = {}) {
     label: inline(token.tokens || [{ type: 'text', text: token.text || token.raw || '' }]),
     ...extra,
   });
+  label.connect('activate-link', onActivateLink);
   return label;
 }
 
@@ -151,6 +187,7 @@ function tableBlock(token) {
       margin_start: 8,
       margin_end: 8,
     });
+    label.connect('activate-link', onActivateLink);
     const box = new Gtk.Box({ hexpand: true });
     box.append(label);
     box.add_css_class('markdown-table-cell');
@@ -190,7 +227,11 @@ function block(token, options) {
     }
     case 'list': return listBlock(token, options);
     case 'table': return tableBlock(token);
-    case 'code': return codeBlock(token);
+    case 'code':
+      if (String(token.lang || '').trim() === 'mermaid' && diagram.isClosedFence(token.raw)) {
+        return diagram.diagramWidget(token.text) || codeBlock(token);
+      }
+      return codeBlock(token);
     case 'blockquote': {
       const frame = new Gtk.Frame({ child: renderTokens(token.tokens || [], options) });
       frame.add_css_class('markdown-quote');

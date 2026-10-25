@@ -18,6 +18,9 @@ import { APPROVALS } from './approvals.js';
 import { clearPassword, lookupPassword, storePassword } from './keyring.js';
 import { showSettingsDialog } from './settings.js';
 import { showSessionDetails } from './details.js';
+import { getPref, setPref } from './prefs.js';
+import * as diagram from './diagram.js';
+import { setSessionLinks } from './markdown.js';
 import { ellipsize } from './text.js';
 import { FOCUS_TOOL, ROUTING_TOOL, TranscriptView, parseRoutedSession } from './transcript.js';
 
@@ -115,8 +118,8 @@ class UsherWindow extends Adw.ApplicationWindow {
     // open conversation's routed targets and focus.
     this._routerId = '';
     this._routerDir = '';
-    this._routerBackend = '';
-    this._routerModels = {};
+    this._routerBackend = getPref('routerBackend', '');
+    this._routerModels = getPref('routerModels', {});
     this._newKind = 'session';
     this._routedTargets = new Set();
     this._routedTargetsKey = '';
@@ -152,6 +155,25 @@ class UsherWindow extends Adw.ApplicationWindow {
     });
 
     this._buildUi();
+
+    // Session ids in messages resolve against the sidebar's sessions.
+    setSessionLinks({
+      resolveSession: ref => {
+        const found = [...(this._sidebar.sessionsById?.values() || [])].filter(s =>
+          s.id === ref || (ref.length === 8 && s.id.startsWith(ref)));
+        return found.length === 1 ? found[0] : null;
+      },
+      openSession: id => this._openSession(id).catch(() => {}),
+    });
+    // Redraw diagrams once pele loads, and on a theme change.
+    diagram.onReady(() => this._rerenderTranscript());
+    diagram.preload();
+    const styleManager = Adw.StyleManager.get_default();
+    const themeHandler = styleManager.connect('notify::dark', () => {
+      if (diagram.anyDrawn()) this._rerenderTranscript();
+    });
+    // The style manager outlives the window.
+    this.connect('destroy', () => styleManager.disconnect(themeHandler));
 
     // Only a backend this app owns reports its lifetime here.
     this._backend.onState = (state, detail) => this._onBackendState(state, detail);
@@ -253,6 +275,19 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._syncNewConfig();
     });
     choice('approval', value => this._pickApproval(value));
+    const groupBy = new Gio.SimpleAction({
+      name: 'group-by',
+      parameter_type: GLib.VariantType.new('s'),
+      state: GLib.Variant.new_string(this._sidebar.groupByDate ? 'date' : 'folder'),
+    });
+    groupBy.connect('activate', (action, parameter) => {
+      const mode = parameter.get_string()[0];
+      action.set_state(GLib.Variant.new_string(mode));
+      setPref('sidebarGroup', mode === 'date' ? 'date' : 'cwd');
+      this._sidebar.setGroupByDate(mode === 'date');
+      if (this._selectedId) this._sidebar.selectSession(this._selectedId);
+    });
+    this.add_action(groupBy);
   }
 
   _showSettings(page = '') {
@@ -376,9 +411,14 @@ class UsherWindow extends Adw.ApplicationWindow {
       GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE
     );
     sidebarHeader.pack_end(searchToggle);
+    this._sidebar.groupByDate = getPref('sidebarGroup', 'cwd') === 'date';
     // Primary menu: app-scoped destinations, per the HIG. Session-scoped
     // actions stay in the conversation header's own menu.
     const primaryMenu = new Gio.Menu();
+    const viewSection = new Gio.Menu();
+    viewSection.append('Group by _Folder', 'win.group-by::folder');
+    viewSection.append('Group by _Date', 'win.group-by::date');
+    primaryMenu.append_section(null, viewSection);
     const appSection = new Gio.Menu();
     // Server profiles are client-local and switching one changes what
     // Settings shows, so the two stay separate entries.
@@ -1283,7 +1323,9 @@ class UsherWindow extends Adw.ApplicationWindow {
       const result = await this._api.startRouter({ initialMessage: text, backend, model });
       if (backend) {
         this._routerBackend = backend;
-        this._routerModels[backend] = model;
+        this._routerModels = { ...this._routerModels, [backend]: model };
+        setPref('routerBackend', backend);
+        setPref('routerModels', this._routerModels);
       }
       this._routerId = result.id;
       this._leaveNewSession();

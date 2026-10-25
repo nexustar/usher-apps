@@ -45,6 +45,18 @@ const CHILD_INDENT = TITLE_INSET + 16;
 
 const DOT_STATES = ['permission', 'unread', 'running', 'live'];
 
+// Date groups, by days before today's midnight.
+export function dateBucket(ms, now = new Date()) {
+  const midnight = new Date(now);
+  midnight.setHours(0, 0, 0, 0);
+  const days = Math.ceil((midnight.getTime() - ms) / 86400000);
+  if (days <= 0) return 'Today';
+  if (days === 1) return 'Yesterday';
+  if (days <= 7) return 'Previous 7 days';
+  if (days <= 30) return 'Previous 30 days';
+  return 'Older';
+}
+
 // One entry in the list. Sessions, their subagents and the archived
 // disclosures all travel as these, because a list view takes one model.
 const SidebarItem = GObject.registerClass(
@@ -62,6 +74,7 @@ export class Sidebar {
     this._ctx = ctx;
     this.sessionsById = new Map();
     this.sessionsDigest = null;
+    this.groupByDate = false;
     this.expandedSubagents = new Set();
     this.expandedArchived = new Set();
     this.archivedPages = new Map();
@@ -186,6 +199,17 @@ export class Sidebar {
         ellipsize: Pango.EllipsizeMode.END,
       });
       content.append(title);
+      // Grouped by date, a row names its directory.
+      const cwd = new Gtk.Label({
+        valign: Gtk.Align.CENTER,
+        single_line_mode: true,
+        ellipsize: Pango.EllipsizeMode.START,
+        max_width_chars: 14,
+        visible: false,
+      });
+      cwd.add_css_class('caption');
+      cwd.add_css_class('dim-label');
+      content.append(cwd);
       const badge = new Gtk.Label({ valign: Gtk.Align.CENTER, visible: false });
       badge.add_css_class('session-count');
       content.append(badge);
@@ -195,7 +219,7 @@ export class Sidebar {
       arrow.add_css_class('session-disclosure');
       content.append(arrow);
       listItem.set_child(content);
-      listItem.parts = { slot, dot, title, badge, arrow, content };
+      listItem.parts = { slot, dot, title, cwd, badge, arrow, content };
 
       // The row is read back off the gesture rather than captured: a closure a
       // widget owns that also refers to that widget is a cycle across the JS
@@ -220,7 +244,8 @@ export class Sidebar {
 
   _bindRow(listItem) {
     const item = listItem.get_item();
-    const { slot, dot, title, badge, arrow, content } = listItem.parts;
+    const { slot, dot, title, cwd, badge, arrow, content } = listItem.parts;
+    cwd.set_visible(false);
     content.item = item;
     const child = item.kind === 'subagent';
     const disclosure = item.kind === 'disclosure';
@@ -250,6 +275,11 @@ export class Sidebar {
     const session = item.session;
     title.set_label(item.title);
     title.set_tooltip_text(item.title);
+    if (item.cwdName) {
+      cwd.set_label(item.cwdName);
+      cwd.set_visible(true);
+      title.set_tooltip_text(`${item.title}\n${session.cwd}`);
+    }
     // Subagents step down in size, not in contrast — dim is what archived
     // looks like. Dimming the content rather than the row keeps the row's
     // selection highlight at full strength.
@@ -359,19 +389,24 @@ export class Sidebar {
 
     const recent = session => Date.parse(session.last_input_at) ||
       Date.parse(session.last_event_at) || 0;
+    // By date, the router's own directory is still a group of its own.
+    const routerDir = this._ctx.routerDir?.() || '';
+    const now = new Date();
+    const groupOf = session => (this.groupByDate && !(routerDir && session.cwd === routerDir)
+      ? dateBucket(recent(session), now)
+      : session.cwd || '(unknown)');
     const groupRecent = new Map();
     for (const session of sessions) {
-      const cwd = session.cwd || '(unknown)';
-      groupRecent.set(cwd, Math.max(groupRecent.get(cwd) || 0, recent(session)));
+      const key = groupOf(session);
+      groupRecent.set(key, Math.max(groupRecent.get(key) || 0, recent(session)));
     }
     sessions.sort((a, b) => {
       if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
       if (a.pinned && b.pinned) return recent(b) - recent(a);
-      const ac = a.cwd || '(unknown)';
-      const bc = b.cwd || '(unknown)';
+      const ac = groupOf(a);
+      const bc = groupOf(b);
       if (ac !== bc) {
         // The router's own directory comes last, whatever its activity.
-        const routerDir = this._ctx.routerDir?.() || '';
         if ((ac === routerDir) !== (bc === routerDir)) return ac === routerDir ? 1 : -1;
         return (groupRecent.get(bc) || 0) - (groupRecent.get(ac) || 0);
       }
@@ -387,8 +422,8 @@ export class Sidebar {
     // sessions would rebuild on every poll: their timestamps tick constantly
     // and only matter here through the ordering, which the sorted array
     // already captures.
-    const digest = sessions.map(session => [
-      session.id, session.title, session.cwd, session.status,
+    const digest = (this.groupByDate ? 'date\n' : '') + sessions.map(session => [
+      session.id, session.title, session.cwd, groupOf(session), session.status,
       session.pinned ? 1 : 0, session.archived ? 1 : 0,
       this._ctx.interactionCount(session.id), this._ctx.isUnread(session.id) ? 1 : 0,
       ...(children.get(session.id) || [])
@@ -428,8 +463,8 @@ export class Sidebar {
     };
 
     for (const session of sessions) {
-      const key = session.pinned ? 'pinned' : (session.cwd || '(unknown)');
-      const label = session.pinned ? 'Pinned' : (session.cwd || '(unknown)');
+      const key = session.pinned ? 'pinned' : groupOf(session);
+      const label = session.pinned ? 'Pinned' : key;
       if (!sections.has(key)) sections.set(key, sections.size);
       if (group?.key !== key) {
         closeGroup();
@@ -441,6 +476,8 @@ export class Sidebar {
         kind: 'session',
         session,
         title: session.title || '(untitled)',
+        cwdName: this.groupByDate && key !== session.cwd && session.cwd
+          ? session.cwd.replace(/\/+$/, '').split('/').pop() : '',
         searchText: `${session.title || ''} ${session.cwd || ''}`.toLowerCase(),
         groupKey: key,
         archived: Boolean(session.archived),
@@ -509,6 +546,16 @@ export class Sidebar {
       }
     }
     this.refilter();
+  }
+
+  // Archived disclosures are keyed by group, so switching forgets them.
+  setGroupByDate(byDate) {
+    if (this.groupByDate === byDate) return;
+    this.groupByDate = byDate;
+    this.expandedArchived.clear();
+    this.archivedPages.clear();
+    this.sessionsDigest = null;
+    this.render([...this.sessionsById.values()]);
   }
 
   subagentCount(sessionId) {

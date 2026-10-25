@@ -11,6 +11,9 @@ js_sources = files(
   'keyring.js',
   'local-auth.js',
   'markdown.js',
+  'diagram.js',
+  'picture.js',
+  'prefs.js',
   'server-store.js',
   'settings.js',
   'sidebar.js',
@@ -28,6 +31,8 @@ install_data(
 install_data(
   'vendor/marked.umd.js',
   'vendor/marked.LICENSE',
+  'vendor/pele.js',
+  'vendor/pele.LICENSE',
   install_dir: get_option('datadir') / app_id / 'js' / 'vendor',
 )
 

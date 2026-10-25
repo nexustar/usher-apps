@@ -12,6 +12,8 @@ import { BackendProcess } from '../src/backend-process.js';
 import { InteractionCards } from '../src/interaction.js';
 import { installStyles } from '../src/style.js';
 import { UsherWindow } from '../src/window.js';
+import * as diagram from '../src/diagram.js';
+import * as markdown from '../src/markdown.js';
 
 const url = GLib.getenv('USHER_TEST_URL');
 if (!url) throw new Error('USHER_TEST_URL is required');
@@ -534,6 +536,58 @@ describe('the app against a live usher', () => {
     }
     expect(win._routerEntry.get_selected_row()).toBeFalsy();
     expect(win._upload.get_visible()).toBeTruthy();
+  });
+
+  it('groups the sidebar from the main menu', () => {
+    win.activate_action('group-by', GLib.Variant.new_string('date'));
+    expect(win._sidebar.groupByDate).toBeTruthy();
+    expect(win.lookup_action('group-by').get_state().get_string()[0]).toBe('date');
+    win.activate_action('group-by', GLib.Variant.new_string('folder'));
+    expect(win._sidebar.groupByDate).toBeFalsy();
+  });
+
+  it('groups the sidebar by date, naming each row\'s directory', () => {
+    try {
+      win._sidebar.setGroupByDate(true);
+      const rows = sidebarItems(win).filter(i => i.kind === 'session' && !i.session.pinned);
+      const buckets = ['Today', 'Yesterday', 'Previous 7 days', 'Previous 30 days', 'Older'];
+      const routerDir = win._routerDir;
+      for (const row of rows) {
+        if (routerDir && row.session.cwd === routerDir) {
+          // The router's directory stays a group of its own.
+          expect(row.sectionLabel).toBe(routerDir);
+        } else {
+          expect(buckets).toContain(row.sectionLabel);
+          expect(row.cwdName).toBe(row.session.cwd.split('/').pop());
+        }
+      }
+    } finally {
+      win._sidebar.setGroupByDate(false);
+    }
+    expect(sidebarItems(win).every(i => !i.cwdName)).toBeTruthy();
+  });
+
+  it('links a session id in a message to that session', async () => {
+    const target = sessions[1];
+    await win._selectSession(sessions[0].id);
+    const body = markdown.render(`Done in ${target.id.slice(0, 8)}, not in deadbeef.`);
+    const label = descend(body).find(w => w instanceof Gtk.Label);
+    expect(label.get_label()).toContain(`usher-session:${target.id}`);
+    expect(label.get_label()).toContain('deadbeef.');
+    expect(label.get_label().includes('usher-session:deadbeef')).toBeFalsy();
+    label.emit('activate-link', `usher-session:${target.id}`);
+    await until('the linked session to open', () => win._selectedId === target.id);
+  });
+
+  it('draws a closed mermaid fence and leaves an open one as code', async () => {
+    await diagram.preload();
+    const drawn = markdown.render('```mermaid\nflowchart LR\n  A[Start] --> B[End]\n```\n');
+    const picture = descend(drawn).find(w => w instanceof Gtk.Picture);
+    expect(picture?.get_paintable()).toBeTruthy();
+    const streaming = markdown.render('```mermaid\nflowchart LR\n  A --> B\n');
+    expect(descend(streaming).some(w => w instanceof Gtk.Picture)).toBeFalsy();
+    const broken = markdown.render('```mermaid\nnot a diagram at all\n```\n');
+    expect(descend(broken).some(w => w instanceof Gtk.Picture)).toBeFalsy();
   });
 
   it('lists Details among the session actions', () => {
