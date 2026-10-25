@@ -202,11 +202,13 @@ export class TranscriptView {
       if (footer.get_first_child()) outer.append(footer);
     }
     for (const reply of routed || []) outer.append(this.routedReplyWidget(reply));
-    return new Adw.Clamp({
+    const clamp = new Adw.Clamp({
       child: outer,
       maximum_size: 900,
       tightening_threshold: 700,
     });
+    clamp.add_css_class('transcript-turn');
+    return clamp;
   }
 
   routedReplyWidget(reply) {

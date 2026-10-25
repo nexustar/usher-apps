@@ -687,6 +687,17 @@ describe('the app against a live usher', () => {
     expect(labels).toContain('_Manage Servers…');
   });
 
+  it('offers a way back to the newest turn when scrolled up', async () => {
+    await win._selectSession(sessions[0].id);
+    await sleep(500);
+    const adjustment = win._chatScroll.get_vadjustment();
+    if (adjustment.get_upper() <= adjustment.get_page_size() + 200) return; // too short to scroll
+    adjustment.set_value(0);
+    expect(win._jumpToLatest.get_visible()).toBeTruthy();
+    win._jumpToLatest.emit('clicked');
+    await until('the bottom', () => !win._jumpToLatest.get_visible());
+  });
+
   it('lists Details among the session actions', () => {
     expect(menuLabels(win._sessionMenuModel(sessions[0]))).toContain('De_tails…');
   });

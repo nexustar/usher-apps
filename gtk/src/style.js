@@ -182,6 +182,14 @@ const CSS = `
   font-weight: normal;
   min-height: 0;
   padding: 1px 6px;
+  opacity: 0;
+  transition: opacity 150ms;
+}
+
+/* Fork shows on the turn under the pointer, or when focused. */
+.transcript-turn:hover .turn-fork,
+.turn-fork:focus-visible {
+  opacity: 1;
 }
 
 

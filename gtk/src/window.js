@@ -560,7 +560,27 @@ class UsherWindow extends Adw.ApplicationWindow {
     adjustment.connect('notify::upper', () => {
       if (this._scrollPending) this._applyScrollToBottom();
     });
-    content.append(this._chatScroll);
+    // Scrolled up, a button takes the reader back to the newest turn.
+    this._jumpToLatest = new Gtk.Button({
+      icon_name: 'go-bottom-symbolic',
+      tooltip_text: 'Jump to latest',
+      halign: Gtk.Align.END,
+      valign: Gtk.Align.END,
+      margin_end: 24,
+      margin_bottom: 18,
+      visible: false,
+    });
+    this._jumpToLatest.add_css_class('osd');
+    this._jumpToLatest.add_css_class('circular');
+    this._jumpToLatest.connect('clicked', () => this._scrollToBottom(true));
+    const chatOverlay = new Gtk.Overlay({ child: this._chatScroll });
+    chatOverlay.add_overlay(this._jumpToLatest);
+    content.append(chatOverlay);
+    const syncJump = () => this._jumpToLatest.set_visible(
+      this._chatScroll.get_visible() && !this._isNearBottom());
+    this._chatScroll.get_vadjustment().connect('value-changed', syncJump);
+    this._chatScroll.get_vadjustment().connect('notify::page-size', syncJump);
+    this._chatScroll.connect('notify::visible', syncJump);
 
     const composer = new Gtk.Box({
       orientation: Gtk.Orientation.VERTICAL,
