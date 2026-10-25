@@ -67,11 +67,11 @@ export class EventStream {
       if (value === '') {
         if (payloadLines.length) {
           const raw = payloadLines.join('\n');
-          // Frames are {session_id, type, data}.
-          let payload;
-          try { payload = JSON.parse(raw)?.data || {}; }
-          catch (_) { payload = { raw }; }
-          this._onEvent(eventName, payload);
+          // Frames are {session_id, type, data}; handlers get the data first.
+          let frame;
+          try { frame = JSON.parse(raw) || {}; }
+          catch (_) { frame = { data: { raw } }; }
+          this._onEvent(eventName, frame.data || {}, frame);
         }
         eventName = 'message';
         payloadLines = [];

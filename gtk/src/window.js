@@ -19,6 +19,7 @@ import { clearPassword, lookupPassword, storePassword } from './keyring.js';
 import { showSettingsDialog } from './settings.js';
 import { showSessionDetails } from './details.js';
 import { getPref, setPref } from './prefs.js';
+import { notifyPermission, notifyTurnDone, withdrawPermission } from './notifications.js';
 import * as diagram from './diagram.js';
 import { setSessionLinks } from './markdown.js';
 import { ellipsize } from './text.js';
@@ -318,6 +319,7 @@ class UsherWindow extends Adw.ApplicationWindow {
     try {
       const interactions = await this._api.listInteractions();
       if (this._connectionEpoch !== epoch || !this._started) return;
+      this._withdrawAnswered(interactions || []);
       this._updateInteractions(interactions || []);
       const sessions = await this._api.listSessions();
       if (this._connectionEpoch !== epoch || !this._started) return;
@@ -796,6 +798,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       const sessions = await this._api.listSessions();
       this._renderSessions(sessions || []);
       this._loadServerConfig();
+      this._startNotifications();
     } catch (error) {
       this._showError('Could not connect to usher', error);
       this._started = false;
@@ -901,6 +904,65 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._renderSessions(await this._api.listSessions() || []);
     } catch (error) {
       this._showToast(error.message || String(error));
+    }
+  }
+
+  openSessionFromNotification(id) {
+    this._openSession(id).catch(error => this._showToast(error.message || String(error)));
+  }
+
+  respondFromNotification(id, behavior) {
+    this._api.respondInteraction(id, { behavior, scope: 'once' })
+      .catch(error => this._showToast(error.message || String(error)));
+  }
+
+  // Notifications follow the server's push rules from the shared event
+  // stream: a turn that ended and a new permission request, skipped for the
+  // session on screen. The requests already pending are not news.
+  async _startNotifications() {
+    const epoch = this._connectionEpoch;
+    this._notificationStream?.stop();
+    let known = [];
+    try {
+      known = await this._api.listInteractions();
+    } catch (_) {
+      // The stream's replay then counts as new.
+    }
+    if (this._connectionEpoch !== epoch) return;
+    this._knownInteractions = new Set(known.map(p => p.id));
+    this._notifiedInteractions = new Set();
+    this._notificationStream = new EventStream(
+      this._api.session,
+      this._api.allEventsUrl(['turn.ended', 'interaction.pending']),
+      (name, data, frame) => {
+        if (this._connectionEpoch === epoch) this._onNotificationEvent(name, data, frame);
+      });
+    this._notificationStream.start();
+  }
+
+  _onNotificationEvent(name, data, frame) {
+    const app = this.get_application();
+    if (!app) return;
+    if (name === 'turn.ended' && frame?.session_id && frame.session_id !== this._selectedId) {
+      notifyTurnDone(app, frame.session_id, this._sidebar.sessionsById?.get(frame.session_id));
+    }
+    if (name === 'interaction.pending' && data.id && !this._knownInteractions.has(data.id)) {
+      this._knownInteractions.add(data.id);
+      if (data.session_id === this._selectedId) return;
+      this._notifiedInteractions.add(data.id);
+      notifyPermission(app, data, this._sidebar.sessionsById?.get(data.session_id));
+    }
+  }
+
+  // An answered request's notification goes; no event announces the answer.
+  _withdrawAnswered(list) {
+    const app = this.get_application();
+    if (!app || !this._notifiedInteractions) return;
+    const pending = new Set(list.map(p => p.id));
+    for (const id of this._notifiedInteractions) {
+      if (pending.has(id)) continue;
+      withdrawPermission(app, id);
+      this._notifiedInteractions.delete(id);
     }
   }
 
@@ -2618,6 +2680,9 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._selectionEpoch++;
     this._connectionEpoch++;
     this._backendCatalog = null;
+    this._notificationStream?.stop();
+    this._notificationStream = null;
+    this._previousStatus = new Map();
     this._selectedId = null;
     this._backend.configure(serverConfig);
     this._api.setBaseUrl(this._backend.baseUrl);
@@ -2649,6 +2714,7 @@ class UsherWindow extends Adw.ApplicationWindow {
       this._showEmptyState();
       this._title.set_subtitle(serverConfig.name || this._backend.baseUrl);
       this._loadServerConfig();
+      this._startNotifications();
       return true;
     } catch (error) {
       // Point the client back at the previously working server so the
@@ -2708,6 +2774,8 @@ class UsherWindow extends Adw.ApplicationWindow {
     this._connectionEpoch++;
     this._backendCatalog = null;
     this._eventStream?.stop();
+    this._notificationStream?.stop();
+    this._notificationStream = null;
     this._backend.stop();
     this._currentServer = null;
     this._started = false;

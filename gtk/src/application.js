@@ -40,6 +40,26 @@ class UsherApplication extends Adw.Application {
     refresh.connect('activate', () => this.active_window?.refresh());
     this.add_action(refresh);
     this.set_accels_for_action('app.refresh', ['<Primary>r']);
+
+    // Targets of the desktop notifications.
+    const openSession = new Gio.SimpleAction({
+      name: 'open-session', parameter_type: GLib.VariantType.new('s'),
+    });
+    openSession.connect('activate', (_action, id) => {
+      const window = this.active_window;
+      if (!window) return;
+      window.present();
+      window.openSessionFromNotification(id.get_string()[0]);
+    });
+    this.add_action(openSession);
+    const respond = new Gio.SimpleAction({
+      name: 'respond-interaction', parameter_type: GLib.VariantType.new('as'),
+    });
+    respond.connect('activate', (_action, value) => {
+      const [id, behavior] = value.deepUnpack();
+      this.active_window?.respondFromNotification(id, behavior);
+    });
+    this.add_action(respond);
     // The shortcut users try first for a settings dialog.
     this.set_accels_for_action('win.settings', ['<Primary>comma']);
     this.set_accels_for_action('win.new-session', ['<Primary>n']);

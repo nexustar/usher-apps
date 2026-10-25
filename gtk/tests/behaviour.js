@@ -618,6 +618,43 @@ describe('the app against a live usher', () => {
     expect(descend(broken).some(w => w instanceof Gtk.Picture)).toBeFalsy();
   });
 
+  it('notifies from the event stream like the server\'s push, not for the open session', () => {
+    const app = win.get_application();
+    const sent = [];
+    const withdrawn = [];
+    const realSend = app.send_notification;
+    const realWithdraw = app.withdraw_notification;
+    app.send_notification = id => sent.push(id);
+    app.withdraw_notification = id => withdrawn.push(id);
+    const realSelected = win._selectedId;
+    try {
+      win._selectedId = sessions[0].id;
+      win._knownInteractions = new Set(['old']);
+      win._notifiedInteractions = new Set();
+      const pending = (id, sid) => ({ id, session_id: sid, kind: 'permission', tool_name: 'Bash' });
+      // Replayed on connect, and already pending before: not news.
+      win._onNotificationEvent('interaction.pending', pending('old', sessions[1].id), {});
+      win._onNotificationEvent('interaction.pending', pending('new', sessions[1].id), {});
+      win._onNotificationEvent('interaction.pending', pending('new', sessions[1].id), {});
+      win._onNotificationEvent('interaction.pending', pending('here', sessions[0].id), {});
+      expect(sent).toEqual(['perm-new']);
+      win._onNotificationEvent('turn.ended', {}, { session_id: sessions[1].id });
+      win._onNotificationEvent('turn.ended', {}, { session_id: sessions[0].id });
+      expect(sent).toEqual(['perm-new', `turn-${sessions[1].id}`]);
+      win._withdrawAnswered([]);
+      expect(withdrawn).toEqual(['perm-new']);
+    } finally {
+      app.send_notification = realSend;
+      app.withdraw_notification = realWithdraw;
+      win._selectedId = realSelected;
+    }
+  });
+
+  it('subscribes to the notification events once connected', () => {
+    expect(win._notificationStream).toBeTruthy();
+    expect(win._notificationStream._url).toContain('/api/v1/events?types=turn.ended,interaction.pending');
+  });
+
   it('matches every search word and opens the first match on Enter', async () => {
     const target = sessions[1];
     const words = (target.title || '').split(/\s+/).filter(w => w.length > 1).slice(0, 2);

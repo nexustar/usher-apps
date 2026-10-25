@@ -11,6 +11,7 @@ js_sources = files(
   'keyring.js',
   'local-auth.js',
   'markdown.js',
+  'notifications.js',
   'diagram.js',
   'picture.js',
   'prefs.js',

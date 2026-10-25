@@ -267,6 +267,12 @@ export class ApiClient {
     return `${this.baseUrl}${API}/sessions/${encodeURIComponent(id)}/events`;
   }
 
+  // Every session's events of these types; pending interactions are replayed
+  // on connect.
+  allEventsUrl(types) {
+    return `${this.baseUrl}${API}/events?types=${types.map(encodeURIComponent).join(',')}`;
+  }
+
   // raw sends { contentType, bytes } as the body instead of JSON.
   async request(method, path, body = null, cancellable = null, raw = null) {
     const message = Soup.Message.new(method, `${this.baseUrl}${path}`);
